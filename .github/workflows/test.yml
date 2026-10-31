@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: FSL-1.1-ALv2
+# Copyright 2026 Julian Siebert. See LICENSE.md.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call: # used by the release workflow before anything is published
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ETCD_VERSION: v3.5.21
+  K3S_VERSION: v1.33.5+k3s1
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: Check that go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Not gofmt-formatted: $unformatted"
+            exit 1
+          fi
+
+      - name: Vet production build
+        run: go vet .
+
+      - name: Vet test build with TPM simulator
+        run: go vet -tags tpmsim .
+
+      - name: Check license headers
+        run: |
+          for f in *.go test.sh Dockerfile .github/workflows/*.yml; do
+            grep -q 'SPDX-License-Identifier: FSL-1.1-ALv2' "$f" || { echo "::error file=$f::Missing license header"; exit 1; }
+          done
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit tests with race detector
+        run: go test -race -count=1 .
+
+  integration-tests:
+    name: Integration tests (etcd, mTLS, TPM simulator)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install OpenSSL headers for the TPM simulator
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev
+
+      - name: Download etcd ${{ env.ETCD_VERSION }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/etcd.tgz" \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/etcd.tgz" -C "$RUNNER_TEMP"
+          echo "E2E_ETCD_DIR=$RUNNER_TEMP/etcd-${ETCD_VERSION}-linux-amd64" >> "$GITHUB_ENV"
+
+      - name: Run attack, mTLS and TPM tests with race detector
+        run: go test -race -tags tpmsim -count=1 -v .
+
+  fuzzing:
+    name: Fuzzing (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - FuzzDecKey
+          - FuzzOpenRecord
+          - FuzzParseReceipt
+          - FuzzParseRange
+          - FuzzParseCheckpoint
+          - FuzzDecodeTPMBlob
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Fuzz for 60 seconds
+        env:
+          TARGET: ${{ matrix.target }}
+        run: go test -run '^$' -fuzz "^${TARGET}\$" -fuzztime 60s .
+
+      - name: Upload failing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failure-${{ matrix.target }}
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+
+  end-to-end:
+    name: End-to-end test (k3s, three instances, rollback attack)
+    needs: [unit-tests]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install OpenSSL headers for the TPM simulator
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev
+
+      - name: Download etcd ${{ env.ETCD_VERSION }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/etcd.tgz" \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/etcd.tgz" -C "$RUNNER_TEMP"
+          echo "ETCD_DIR=$RUNNER_TEMP/etcd-${ETCD_VERSION}-linux-amd64" >> "$GITHUB_ENV"
+
+      - name: Download k3s ${{ env.K3S_VERSION }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/k3s" "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION//+/%2B}/k3s"
+          chmod +x "$RUNNER_TEMP/k3s"
+          echo "K3S_BIN=$RUNNER_TEMP/k3s" >> "$GITHUB_ENV"
+
+      - name: Build test binary with TPM simulator
+        run: go build -tags tpmsim -o veil-proxy-tpmsim .
+
+      - name: Run end-to-end test
+        run: sudo --preserve-env=ETCD_DIR,K3S_BIN ./test.sh
+
+      - name: Make logs readable (the test ran as root)
+        if: failure()
+        run: sudo chmod -R a+rX .testrun
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: end-to-end-logs
+          path: |
+            .testrun/*.log
+            .testrun/*.state
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  docker-build:
+    name: Docker image build (amd64, arm64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image for all platforms
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build image for this runner
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: veil-proxy:ci
+          build-args: VERSION=ci
+          cache-from: type=gha
+
+      - name: Smoke-test the image
+        run: |
+          out=$(docker run --rm veil-proxy:ci -version)
+          echo "$out"
+          [ "$out" = "veil-proxy ci" ]
