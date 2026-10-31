@@ -482,6 +482,38 @@ func TestAttackNormalOperationTwoInstances(t *testing.T) {
 	}
 }
 
+func TestBackendTarget(t *testing.T) {
+	for _, c := range []struct{ in, target, host string }{
+		{"127.0.0.1:2379", "dns:///127.0.0.1:2379", "127.0.0.1"},
+		{"backend.veilplane.com:443", "dns:///backend.veilplane.com:443", "backend.veilplane.com"},
+		{"10.0.0.1:2379, 10.0.0.2:2379", "veil-backends:///backend", "10.0.0.1"},
+	} {
+		target, _, host := backendTarget(c.in)
+		if target != c.target || host != c.host {
+			t.Errorf("%q: got %q %q, want %q %q", c.in, target, host, c.target, c.host)
+		}
+	}
+}
+
+// With several backend addresses, a dead one is skipped: calls go to the instances that work.
+func TestSeveralBackendAddresses(t *testing.T) {
+	dir := needEtcd(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, _ := startEtcd(t, dir, 23880)
+	a := startProxy(t, ctx, "127.0.0.1:1,"+addr) // nothing listens on port 1
+	ka := dial(t, a.addr)
+	for i := 0; i < 20; i++ {
+		if _, err := ka.Put(ctx, &pb.PutRequest{Key: []byte(fmt.Sprintf("/k/%d", i)), Value: []byte("v")}); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	resp, err := ka.Range(ctx, &pb.RangeRequest{Key: []byte("/k/"), RangeEnd: []byte("/k0")})
+	if err != nil || resp.Count != 20 {
+		t.Fatalf("range: %v %v", resp, err)
+	}
+}
+
 func TestAttackReplayedValue(t *testing.T) {
 	dir := needEtcd(t)
 	ctx, cancel := context.WithCancel(context.Background())

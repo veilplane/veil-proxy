@@ -72,6 +72,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
 )
 
@@ -110,7 +112,7 @@ func main() {
 	}
 	var cfg config
 	flag.StringVar(&cfg.listen, "listen", "127.0.0.1:2389", "address kube-apiserver connects to")
-	flag.StringVar(&cfg.upstream, "upstream", "127.0.0.1:2379", "hosted etcd-compatible backend")
+	flag.StringVar(&cfg.upstream, "upstream", "127.0.0.1:2379", "hosted etcd-compatible backend: host:port (all addresses of the name are used), or a comma separated list of host:port")
 	flag.StringVar(&cfg.stateFile, "state-file", "veil.state", "where verified checkpoints are persisted")
 	flag.StringVar(&cfg.peerListen, "peer-listen", "", "address to serve signed checkpoints to the other instances, e.g. 0.0.0.0:2390")
 	flag.DurationVar(&cfg.delay, "delay", 0, "simulated round trip time to the backend, e.g. 30ms")
@@ -173,6 +175,31 @@ func fatal(what string, err error) {
 	os.Exit(1)
 }
 
+// backendTarget turns -upstream into a gRPC target. Several backend instances can be given as
+// one DNS name with several addresses ("backend.veilplane.com:443", resolved again whenever a
+// connection fails) or as a list ("10.0.0.1:2379,10.0.0.2:2379"). firstHost is the default
+// server name expected in the backend certificate.
+func backendTarget(upstream string) (target string, opt grpc.DialOption, firstHost string) {
+	addrs := splitList(upstream)
+	if len(addrs) == 0 {
+		addrs = []string{upstream}
+	}
+	firstHost = addrs[0]
+	if h, _, err := net.SplitHostPort(addrs[0]); err == nil {
+		firstHost = h
+	}
+	if len(addrs) == 1 {
+		return "dns:///" + addrs[0], grpc.EmptyDialOption{}, firstHost
+	}
+	r := manual.NewBuilderWithScheme("veil-backends")
+	state := resolver.State{}
+	for _, a := range addrs {
+		state.Addresses = append(state.Addresses, resolver.Address{Addr: a})
+	}
+	r.InitialState(state)
+	return r.Scheme() + ":///backend", grpc.WithResolvers(r), firstHost
+}
+
 func splitList(s string) []string {
 	var out []string
 	for _, v := range strings.Split(s, ",") {
@@ -190,6 +217,10 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 	if err != nil {
 		return nil, err
 	}
+	target, resolverOpt, firstHost := backendTarget(cfg.upstream)
+	if cfg.backendName == "" {
+		cfg.backendName = firstHost
+	}
 	ts, err := newTLSSetup(cfg)
 	if err != nil {
 		return nil, err
@@ -201,7 +232,9 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 	} else {
 		slog.Warn("no -cert given, the backend connection is NOT encrypted (development only)")
 	}
-	conn, err := grpc.Dial(cfg.upstream, grpc.WithTransportCredentials(creds),
+	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(creds), resolverOpt,
+		// spread calls over all backend instances; a failed instance drops out until it is back
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`),
 		// detect dead backend connections (the watch stream is long-lived)
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: true}),
 		// reconnect quickly after a backend restart (gRPC's default backoff grows to 2 minutes,
@@ -659,7 +692,7 @@ func newTLSSetup(cfg config) (*tlsSetup, error) {
 	ts := &tlsSetup{id: id, backend: &tls.Config{
 		MinVersion:           tls.VersionTLS13,
 		RootCAs:              backendCA,
-		ServerName:           cfg.backendName, // empty: gRPC uses the host of -upstream
+		ServerName:           cfg.backendName, // default: host of the (first) -upstream address
 		GetClientCertificate: clientCert,
 	}}
 	if cfg.peerCA == "" {

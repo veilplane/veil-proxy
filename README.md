@@ -119,7 +119,7 @@ TPM-sealed key.
 | Flag | Default | Meaning |
 |---|---|---|
 | `-listen` | `127.0.0.1:2389` | Address kube-apiserver connects to (plaintext gRPC, keep it local) |
-| `-upstream` | `127.0.0.1:2379` | Backend address |
+| `-upstream` | `127.0.0.1:2379` | Backend: `host:port` (every address of the name is used) or a comma separated list of `host:port` |
 | `-key-file` | `master.key` | Master key: PEM `VEIL TPM SEALED` or 64 hex characters |
 | `-tpm` | `/dev/tpmrm0` | TPM device, used when `-key` or `-key-file` contain TPM blobs |
 | `-cert`, `-key` | | Device certificate (PEM) and its key: PEM `VEIL TPM KEY` or a PEM private key |
@@ -564,7 +564,7 @@ proxy never sends a tenant id itself.
 Three TLS configurations exist (`newTLSSetup`):
 
 - backend client: roots from `-backend-ca`, server name from `-backend-name`
-  or the host of `-upstream`;
+  or the host of the (first) `-upstream` address;
 - peer server: requires a client certificate from `-peer-ca` with the same
   trust domain and cluster id;
 - peer client: verifies the peer's server certificate against `-peer-ca`
@@ -730,6 +730,23 @@ Any backend works that behaves like a single etcd v3 cluster per tenant:
 
 Any deviation is detected by the proxy, so a buggy backend shows up as
 `DataLoss` errors, not as silent corruption.
+
+### Several backend instances
+
+The backend may consist of several instances that share one state. `-upstream`
+can name all of them, either as one DNS name with several addresses
+(`backend.veilplane.com:443`, resolved again whenever a connection fails) or as
+a list (`10.0.0.1:2379,10.0.0.2:2379`). The proxy spreads its calls over all
+reachable instances (gRPC `round_robin`, see `backendTarget`); a failed instance
+drops out and is retried with a backoff of at most 3 seconds. The instances must
+behave as one: a write committed through one instance is visible to reads and
+watches through all others. The watch stream may sit on a different instance
+than the writes; the proxy waits until its replica has applied the revision of
+its own write, so a backend that is slow to pass revisions between instances
+makes writes slow, not wrong.
+
+Responses from the backend may be up to 2 GB (`maxBackendMessage`), so loading
+a large key space in one `Range` works.
 
 ## 13. Testing
 
