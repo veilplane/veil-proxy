@@ -55,6 +55,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,6 +85,7 @@ type config struct {
 	stateFile             string
 	peerListen            string
 	peers                 []string
+	peersFile             string
 	master                []byte
 	delay, history        time.Duration
 	verbose, trustBackend bool
@@ -103,8 +105,8 @@ type config struct {
 var buildVersion = "dev"
 
 func main() {
-	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "tpm-") {
-		if err := tpmCommand(os.Args[1:]); err != nil {
+	if len(os.Args) > 1 && setupCommands[os.Args[1]] {
+		if err := setupCommand(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -129,6 +131,7 @@ func main() {
 	tpmPath := flag.String("tpm", "/dev/tpmrm0", "TPM device, used when -key or -key-file are TPM blobs")
 	genKey := flag.Bool("gen-key", false, "print a new random master key and exit")
 	peers := flag.String("peers", "", "comma separated peer-listen addresses of the other instances")
+	flag.StringVar(&cfg.peersFile, "peers-file", "", "file with more peer addresses (one per line), read again when it changes")
 	logFormat := flag.String("log-format", "json", "json or text")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -258,6 +261,7 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 		metrics: &metrics{},
 	}
 	p.fresh = newFreshness(s.peerMAC, cfg.stateFile, cfg.peers, p.rep)
+	p.fresh.peersFile = cfg.peersFile
 	p.closers = append(p.closers, conn.Close)
 	if cfg.tpm != nil {
 		p.closers = append(p.closers, cfg.tpm.close)
@@ -275,7 +279,7 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 	if ts != nil && ts.peerClient != nil {
 		p.fresh.scheme = "https"
 		p.fresh.client.Transport = &http.Transport{TLSClientConfig: ts.peerClient}
-	} else if ts != nil && (cfg.peerListen != "" || len(cfg.peers) > 0) {
+	} else if ts != nil && (cfg.peerListen != "" || len(cfg.peers) > 0 || cfg.peersFile != "") {
 		return nil, errors.New("-peer-ca is required for peers when mTLS is used")
 	}
 
@@ -724,11 +728,26 @@ func newTLSSetup(cfg config) (*tlsSetup, error) {
 		GetCertificate:   func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return src.get() },
 		VerifyConnection: sameCluster,
 	}
+	// Device certificates name no hosts (the backend issues them with the spiffe:// URI only),
+	// so the client verifies the chain itself instead of matching the address.
 	ts.peerClient = &tls.Config{
 		MinVersion:           tls.VersionTLS13,
-		RootCAs:              peerCA,
+		InsecureSkipVerify:   true, // replaced by the chain check in VerifyConnection
 		GetClientCertificate: clientCert,
-		VerifyConnection:     sameCluster,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("peer sent no certificate")
+			}
+			inter := x509.NewCertPool()
+			for _, c := range cs.PeerCertificates[1:] {
+				inter.AddCert(c)
+			}
+			if _, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: peerCA, Intermediates: inter,
+				KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+				return err
+			}
+			return sameCluster(cs)
+		},
 	}
 	return ts, nil
 }
@@ -985,8 +1004,13 @@ type freshness struct {
 	file   string
 	peers  []string
 	client *http.Client
-	scheme string // "https" with mTLS
-	rep    *replica
+
+	peersFile string // -peers-file: re-read when it changes
+	peersMu   sync.Mutex
+	peersMod  time.Time
+	extra     []string // -peers plus the file
+	scheme    string   // "https" with mTLS
+	rep       *replica
 
 	mu     sync.Mutex
 	last   checkpoint // last persisted own checkpoint
@@ -1148,13 +1172,44 @@ func (f *freshness) fetch(peer, path string) (checkpoint, bool) {
 	return c, true
 }
 
+// peerList returns -peers plus the addresses in -peers-file (one per line or comma
+// separated), which is read again whenever it changes, so instances can be added without a
+// restart. A missing file means no extra peers.
+func (f *freshness) peerList() []string {
+	if f.peersFile == "" {
+		return f.peers
+	}
+	f.peersMu.Lock()
+	defer f.peersMu.Unlock()
+	st, err := os.Stat(f.peersFile)
+	if err != nil {
+		return f.peers
+	}
+	if !st.ModTime().Equal(f.peersMod) {
+		raw, err := os.ReadFile(f.peersFile)
+		if err == nil {
+			list := append([]string(nil), f.peers...)
+			for _, a := range splitList(strings.ReplaceAll(string(raw), "\n", ",")) {
+				if !slices.Contains(list, a) {
+					list = append(list, a)
+				}
+			}
+			f.extra, f.peersMod = list, st.ModTime()
+		}
+	}
+	if f.extra == nil {
+		return f.peers
+	}
+	return f.extra
+}
+
 // pull fetches the latest checkpoint of every reachable peer, raises the floor
 // and hands the digests to the replica for fork detection.
 func (f *freshness) pull() []checkpoint {
 	var mu sync.Mutex
 	var out []checkpoint
 	var wg sync.WaitGroup
-	for _, peer := range f.peers {
+	for _, peer := range f.peerList() {
 		wg.Add(1)
 		go func(peer string) {
 			defer wg.Done()

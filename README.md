@@ -73,9 +73,11 @@ serve. It can not make the proxy accept false data.
 |---|---|
 | `main.go` | Entry point, startup and startup verification, mTLS, cryptography, key ranges, freshness and checkpoints, peer protocol, operations endpoints, gRPC services, write path |
 | `replica.go` | Verified replica: data model, verification of changes, state digest, history window, serving reads and watches |
-| `tpm.go` | TPM access: storage root key, device signing key, sealed master key, `tpm-keygen` and `tpm-seal` subcommands |
+| `tpm.go` | TPM access: storage root key, device signing key, sealed master key |
+| `setup.go` | Subcommands for setting up a node (used by veilctl): `keygen`, `seal`, `sign`, `key-send`, `key-receive` |
 | `tpmsim.go` | Build tag `tpmsim` only: adds the `simulator:<seed>` TPM path for tests |
 | `main_test.go` | Unit tests, attack tests against a real etcd, mTLS tests, operations, load test, fuzz targets |
+| `setup_test.go` | Tests of the setup subcommands without TPM, including the master key transfer and its refusals |
 | `tpm_test.go` | Build tag `tpmsim` only: TPM tests with the simulator |
 | `test.sh` | End-to-end test with k3s, three instances, mTLS, TPM and a rollback attack |
 | `Dockerfile`, `.dockerignore` | Container image built `FROM scratch` |
@@ -128,6 +130,7 @@ TPM-sealed key.
 | `-peer-ca` | | CA bundle that signs device certificates (required for peers with `-cert`) |
 | `-peer-listen` | | Address to serve checkpoints to other instances |
 | `-peers` | | Comma separated `-peer-listen` addresses of other instances |
+| `-peers-file` | | File with more peer addresses (one per line); read again whenever it changes, so instances can be added without a restart (veilctl keeps it up to date) |
 | `-state-file` | `veil.state` | Where verified checkpoints are persisted |
 | `-history` | `10m` | Verified history kept in memory; must exceed the API server's compaction interval (5 min by default) |
 | `-ops-listen` | `127.0.0.1:9390` | `/healthz`, `/readyz`, `/metrics`; empty disables |
@@ -138,13 +141,43 @@ TPM-sealed key.
 | `-delay` | `0` | Tests only: sleep this long per backend round trip |
 | `-v` | `false` | Tests only: log every request including plaintext keys |
 
-Subcommands (production nodes normally get this from veil-agent):
+### Setup subcommands
+
+Production nodes are set up with [veilctl](https://github.com/veilplane/veilctl), which calls
+these subcommands, so that all cryptography and TPM access stays in this program. All of them
+take `-tpm <device>`; `-tpm none` uses plain files instead (development and tests only).
 
 ```bash
-veil-proxy tpm-keygen -tpm /dev/tpmrm0 -out node.tpmkey -csr node.csr \
-  -uri spiffe://<domain>/cluster/<cluster-id>/node/<node-name> [-ip 10.0.0.1] [-dns node1.example]
-veil-proxy tpm-seal -tpm /dev/tpmrm0 -in master.hex -out master.sealed
+veil-proxy keygen -out node.tpmkey -csr node.csr [-uri spiffe://...] [-ip ...] [-dns ...]
+veil-proxy seal -new -out master.sealed            # new random master key, sealed by the TPM
+veil-proxy seal -in master.hex -out master.sealed  # seal an existing hex key
+veil-proxy sign -key node.tpmkey < request.json    # base64 ECDSA-SHA256 (DER) signature
+veil-proxy key-send -cert node.pem -key node.tpmkey -peer-ca device-ca.pem \
+  -secret-file secret -key-file master.sealed -listen :2391 -timeout 1h
+veil-proxy key-receive -cert node.pem -key node.tpmkey -peer-ca device-ca.pem \
+  -secret-file secret -key-file master.sealed -from 10.0.0.5:2391
 ```
+
+`tpm-keygen` and `tpm-seal` are kept as old names of `keygen` and `seal`.
+
+### Master key transfer
+
+A new node of a cluster gets the master key directly from an existing node, never through
+the backend (`key-send` on the existing node, `key-receive` on the new one, see `setup.go`).
+The invite code that veilctl prints contains a random 32-byte secret that the backend never
+sees. Both sides authenticate with their device certificates (verified against the device
+CA, same trust domain and cluster). Because the hoster runs the device CA and could issue
+itself a certificate, the transfer is additionally bound to the secret:
+
+```
+auth key, enc key = HKDF-SHA256(secret, "veil key transfer v1 auth" / "... enc")
+request:  {node, nonce, mac = HMAC(auth key, "veil key request" | nonce | node | fp)}
+response: {nonce', box = AES-256-GCM(enc key, nonce', master key, aad = "veil key transfer" | nonce | fp)}
+```
+
+`fp` is the SHA-256 of the requester's certificate as seen in the TLS handshake, so an
+answer is only usable on that connection. The sender hands the key out once and exits; five
+requests with a wrong secret also make it stop. The receiver seals the key with its own TPM.
 
 ## 4. Threat model
 
@@ -567,11 +600,13 @@ Three TLS configurations exist (`newTLSSetup`):
   or the host of the (first) `-upstream` address;
 - peer server: requires a client certificate from `-peer-ca` with the same
   trust domain and cluster id;
-- peer client: verifies the peer's server certificate against `-peer-ca`
-  (including host name or IP SAN) and the same cluster check.
+- peer client: verifies the peer's certificate chain against `-peer-ca` and the
+  same cluster check. It does not match host names: the backend issues device
+  certificates with the `spiffe://` URI as the only name, so the identity is the
+  URI, not the address.
 
 Device certificates therefore need the extended key usages `clientAuth` and
-`serverAuth` and the node's IP or DNS name as SAN.
+`serverAuth`.
 
 `certSource` reloads certificate and key when their files change, so
 short-lived certificates can be rotated without restart. If a reload fails
@@ -605,7 +640,7 @@ use and closed on shutdown.
 For tests, `tpmsim.go` (build tag `tpmsim`) routes the TPM path
 `simulator:<seed>` to the Microsoft TPM 2.0 reference implementation from
 `github.com/google/go-tpm-tools/simulator`. With a fixed seed the simulated TPM
-derives the same SRK in every process, so a blob created by `tpm-keygen` in one
+derives the same SRK in every process, so a blob created by `keygen` in one
 process can be loaded by a later proxy process. Different seeds behave like
 different machines. The simulator allows only one open instance per process.
 

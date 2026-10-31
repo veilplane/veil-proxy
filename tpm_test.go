@@ -12,7 +12,9 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -164,4 +166,91 @@ func TestAttackMTLSWithTPM(t *testing.T) {
 		t.Fatalf("%v %v", resp, err)
 	}
 	t.Log("mTLS handshake signed inside the TPM, master key unsealed from the TPM")
+}
+
+// The setup subcommands with a (simulated) TPM: device key and CSR, signing, a new sealed
+// master key, and a key transfer that ends sealed in the receiver's TPM. The simulator can
+// only run once per process, so every TPM is closed before the next one is opened and the
+// sending node in the transfer uses plain files.
+func TestTPMSetupCommands(t *testing.T) {
+	dir := t.TempDir()
+	key, csrFile := filepath.Join(dir, "node.tpmkey"), filepath.Join(dir, "node.csr")
+	if err := keygen("simulator:21", key, csrFile, "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(key)
+	if b, _ := pem.Decode(raw); b == nil || b.Type != pemTPMKey {
+		t.Fatal("device key is not a TPM blob")
+	}
+	raw, _ = os.ReadFile(csrFile)
+	block, _ := pem.Decode(raw)
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil || csr.CheckSignature() != nil {
+		t.Fatalf("CSR: %v", err)
+	}
+	sig, err := signWith("simulator:21", key, []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("hello"))
+	if !ecdsa.VerifyASN1(csr.PublicKey.(*ecdsa.PublicKey), digest[:], sig) {
+		t.Fatal("TPM signature does not verify")
+	}
+
+	sealed := filepath.Join(dir, "master.sealed")
+	if err := setupCommand([]string{"seal", "-tpm", "simulator:21", "-new", "-out", sealed}); err != nil {
+		t.Fatal(err)
+	}
+	unseal := func(file, tpm string) ([]byte, error) {
+		o := &tpmOpener{path: tpm}
+		defer o.close()
+		return loadMasterKey(file, o)
+	}
+	master, err := unseal(sealed, "simulator:21")
+	if err != nil || len(master) != 32 {
+		t.Fatalf("unseal: %v", err)
+	}
+	if _, err := unseal(sealed, "simulator:22"); err == nil {
+		t.Fatal("another TPM unsealed the master key")
+	}
+
+	// transfer from a node with plain files to a new node with TPM 22
+	ca := newTestCA(t, dir, "device-ca")
+	cfA, kfA := issueDevice(t, ca, dir, "a", "spiffe://veilplane.com/cluster/c1/node/a")
+	hexMaster := filepath.Join(dir, "a.master")
+	sealTo(&tpmOpener{path: noTPM}, hexMaster, master)
+	key2, csr2 := filepath.Join(dir, "b.tpmkey"), filepath.Join(dir, "b.csr")
+	if err := keygen("simulator:22", key2, csr2, "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(csr2)
+	block, _ = pem.Decode(raw)
+	creq2, _ := x509.ParseCertificateRequest(block.Bytes)
+	ca.issueFor(t, filepath.Join(dir, "b.pem"), creq2.PublicKey, "spiffe://veilplane.com/cluster/c1/node/b")
+	secret := filepath.Join(dir, "secret")
+	os.WriteFile(secret, []byte("c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0"), 0o600)
+	a := transferFlags{cert: cfA, key: kfA, peerCA: ca.file, secretFile: secret, masterFile: hexMaster,
+		tpm: &tpmOpener{path: noTPM}}
+	b := transferFlags{cert: filepath.Join(dir, "b.pem"), key: key2, peerCA: ca.file, secretFile: secret,
+		masterFile: filepath.Join(dir, "b.sealed"), tpm: &tpmOpener{path: "simulator:22"}}
+	addr := freeAddr(t)
+	sent := make(chan error, 1)
+	go func() { sent <- keySend(a, addr, 20*time.Second) }()
+	time.Sleep(300 * time.Millisecond)
+	err = keyReceive(b, addr)
+	b.tpm.close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(b.masterFile)
+	if blk, _ := pem.Decode(raw); blk == nil || blk.Type != pemTPMSealed {
+		t.Fatal("received master key is not sealed")
+	}
+	got, err := unseal(b.masterFile, "simulator:22")
+	if err != nil || !bytes.Equal(got, master) {
+		t.Fatalf("received key differs: %v", err)
+	}
 }

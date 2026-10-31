@@ -24,19 +24,14 @@ package main
 import (
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"math/big"
-	"net"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -311,81 +306,7 @@ func hexKey(s string) ([]byte, error) {
 	return key, nil
 }
 
-// ---------------------------------------------------------------- subcommands
-
-// tpmCommand implements "veil-proxy tpm-keygen" and "veil-proxy tpm-seal".
-// In production veil-agent does this during enrollment.
-func tpmCommand(args []string) error {
-	fs := flag.NewFlagSet(args[0], flag.ExitOnError)
-	path := fs.String("tpm", "/dev/tpmrm0", "TPM device")
-	out := fs.String("out", "", "output file for the TPM blob")
-	switch args[0] {
-	case "tpm-keygen":
-		csrFile := fs.String("csr", "", "write a certificate signing request (PEM) here")
-		uri := fs.String("uri", "", "spiffe://<domain>/cluster/<id>/node/<name> for the CSR")
-		ips := fs.String("ip", "", "comma separated IP SANs for the CSR")
-		dns := fs.String("dns", "", "comma separated DNS SANs for the CSR")
-		fs.Parse(args[1:])
-		if *out == "" || *csrFile == "" || *uri == "" {
-			return errors.New("tpm-keygen needs -out, -csr and -uri")
-		}
-		u, err := url.Parse(*uri)
-		if err != nil {
-			return err
-		}
-		dev, err := newTPMDevice(*path)
-		if err != nil {
-			return err
-		}
-		defer dev.Close()
-		blob, err := dev.create(signingKeyTemplate, nil)
-		if err != nil {
-			return err
-		}
-		s, err := dev.signer(blob)
-		if err != nil {
-			return err
-		}
-		tmpl := &x509.CertificateRequest{Subject: pkix.Name{CommonName: u.Path}, URIs: []*url.URL{u}, DNSNames: splitList(*dns)}
-		for _, ip := range splitList(*ips) {
-			tmpl.IPAddresses = append(tmpl.IPAddresses, net.ParseIP(ip))
-		}
-		csr, err := x509.CreateCertificateRequest(nil, tmpl, s)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(*out, pem.EncodeToMemory(&pem.Block{Type: pemTPMKey, Bytes: blob}), 0o600); err != nil {
-			return err
-		}
-		return os.WriteFile(*csrFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr}), 0o644)
-
-	case "tpm-seal":
-		in := fs.String("in", "", "hex master key to seal (the file should be deleted afterwards)")
-		fs.Parse(args[1:])
-		if *out == "" || *in == "" {
-			return errors.New("tpm-seal needs -in and -out")
-		}
-		raw, err := os.ReadFile(*in)
-		if err != nil {
-			return err
-		}
-		key, err := hexKey(string(raw))
-		if err != nil {
-			return err
-		}
-		dev, err := newTPMDevice(*path)
-		if err != nil {
-			return err
-		}
-		defer dev.Close()
-		blob, err := dev.seal(key)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(*out, pem.EncodeToMemory(&pem.Block{Type: pemTPMSealed, Bytes: blob}), 0o600)
-	}
-	return fmt.Errorf("unknown command %q", args[0])
-}
+// ---------------------------------------------------------------- helpers
 
 // publicKeysEqual compares the certificate's key with the TPM key.
 func publicKeysEqual(a, b crypto.PublicKey) bool {
