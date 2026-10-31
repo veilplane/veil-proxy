@@ -857,10 +857,28 @@ func FuzzParseReceipt(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) { parseReceipt(b) })
 }
 
+// The base64 decoder skips line breaks even in strict mode; a key with one inserted must not
+// decode, or the backend could store the same plaintext key under several spellings.
+func TestDecKeyRejectsLineBreaks(t *testing.T) {
+	s, _ := newSealer(bytes.Repeat([]byte{1}, 32))
+	ek := s.encKey("/registry/pods")
+	for _, lb := range []string{"\n", "\r", "\r\n"} {
+		bad := ek[:10] + lb + ek[10:]
+		if pk, err := s.decKey(bad); err == nil {
+			t.Errorf("decKey accepted %q -> %q", bad, pk)
+		}
+	}
+	if _, err := s.decKey(ek); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func FuzzDecKey(f *testing.F) {
 	s, _ := newSealer(bytes.Repeat([]byte{1}, 32))
 	f.Add(s.encKey("/registry/pods/x/y"))
 	f.Add("/a//b/")
+	ek := s.encKey("/registry/pods")
+	f.Add(ek[:10] + "\n" + ek[10:])
 	f.Fuzz(func(t *testing.T, k string) {
 		if pk, err := s.decKey(k); err == nil && s.encKey(pk) != k {
 			t.Fatalf("decKey accepted a non-canonical key %q -> %q", k, pk)

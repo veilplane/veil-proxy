@@ -790,8 +790,10 @@ func (s *sealer) encSegment(parent, seg string) string {
 }
 
 func (s *sealer) decSegment(parent, enc string) (string, error) {
-	raw, err := base64.RawURLEncoding.Strict().DecodeString(enc) // one spelling per key
-	if err != nil {
+	// Exactly one spelling per key: Strict() rejects non-zero padding bits, but the decoder
+	// still skips '\r' and '\n', so the re-encoding must also match.
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(enc)
+	if err != nil || base64.RawURLEncoding.EncodeToString(raw) != enc {
 		return "", errors.New("not an encrypted key segment")
 	}
 	pt, err := s.seg.DecryptDeterministically(raw, []byte(parent))
