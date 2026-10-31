@@ -100,7 +100,7 @@ func TestTPMSignerTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	ca := newTestCA(t, dir, "device-ca")
-	ca.issueFor(t, certFile, s.Public(), "spiffe://veilplane.example/cluster/c1/node/tpm")
+	ca.issueFor(t, certFile, s.Public(), "spiffe://veilplane.com/cluster/c1/node/tpm")
 	dev.flush(s.h)
 
 	src := &certSource{certFile: certFile, keyFile: keyFile, tpm: o}
@@ -112,7 +112,7 @@ func TestTPMSignerTLS(t *testing.T) {
 		t.Fatal("private key is not TPM-backed")
 	}
 	// A certificate for a different key must be rejected.
-	cf2, _ := ca.issue(t, dir, "other", "spiffe://veilplane.example/cluster/c1/node/other")
+	cf2, _ := ca.issue(t, dir, "other", "spiffe://veilplane.com/cluster/c1/node/other")
 	if _, err := (&certSource{certFile: cf2, keyFile: keyFile, tpm: o}).get(); err == nil {
 		t.Fatal("certificate of another key accepted for the TPM key")
 	}
@@ -141,7 +141,7 @@ func TestAttackMTLSWithTPM(t *testing.T) {
 	s, _ := dev.signer(blob)
 	keyFile, certFile, sealedFile := filepath.Join(dir, "n.tpmkey"), filepath.Join(dir, "n.pem"), filepath.Join(dir, "m.sealed")
 	writePEM(t, keyFile, pemTPMKey, blob)
-	deviceCA.issueFor(t, certFile, s.Public(), "spiffe://veilplane.example/cluster/c1/node/tpm-node")
+	deviceCA.issueFor(t, certFile, s.Public(), "spiffe://veilplane.com/cluster/c1/node/tpm-node")
 	dev.flush(s.h)
 	sealed, _ := dev.seal(bytes.Repeat([]byte{7}, 32))
 	writePEM(t, sealedFile, pemTPMSealed, sealed)

@@ -1,11 +1,11 @@
 # veil-proxy
 
-veil-proxy is the customer-side component of [Veilplane](https://veilplane.com). 
-It runs next to kube-apiserver on every control plane node and speaks the 
-etcd v3 gRPC API to it. Behind it is a hosted, untrusted etcd-compatible backend. 
-veil-proxy encrypts every key and value before it reaches the backend 
-and verifies every answer the backend gives, so that the operator of the backend 
-can neither read cluster data nor change it unnoticed.
+veil-proxy is the customer-side component of Veilplane. It runs next to
+kube-apiserver on every control plane node and speaks the etcd v3 gRPC API to
+it. Behind it is a hosted, untrusted etcd-compatible backend. veil-proxy
+encrypts every key and value before it reaches the backend and verifies every
+answer the backend gives, so that the operator of the backend can neither read
+cluster data nor change it unnoticed.
 
 This document describes how veil-proxy works, which formats it uses and what
 has to be kept in mind when changing it.
@@ -536,11 +536,11 @@ them. With mTLS, peers are authenticated by device certificate and cluster id
    - digest mismatch: the replica fails (forged or forked history).
    - match: verified. The replica then follows the change stream from there and
      verifies every change up to the present.
-3. No candidate available:
-   - no state file and no peer checkpoint: only an empty backend is accepted
-     (first start of a new cluster);
+3. No candidate could be verified (none exists, or all were compacted):
    - `-trust-backend`: the current backend state is accepted unverified;
-   - otherwise the replica fails.
+   - no state file: only an empty backend is accepted (first start of a new
+     cluster); a backend that holds data makes the replica fail;
+   - state file present: the replica fails.
 
 Infrastructure errors (backend unreachable) are retried every second.
 
@@ -648,12 +648,64 @@ and the watch is re-established.
 
 ### Running
 
-- systemd: run as a normal service on the node. The proxy must not run inside
-  the Kubernetes cluster it serves: the API server cannot start without it.
-- Docker: the image is `FROM scratch` and runs as user 65532. Use
-  `--network host`, a volume for the state file and the TPM blobs, and pass the
-  TPM with `--device /dev/tpmrm0` and the group that owns it. The TPM blobs are
-  bound to the host's TPM, so containers can be recreated freely.
+The proxy must not run inside the Kubernetes cluster it serves: the API server
+cannot start without it, and without the API server the pod would not be
+started. Run it as a systemd service or a container directly on the node, and
+point k3s at it with `--datastore-endpoint http://127.0.0.1:2389`.
+
+systemd:
+
+```ini
+[Unit]
+Description=Veilplane proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/veil-proxy \
+  -upstream backend.veilplane.com:443 -listen 127.0.0.1:2389 \
+  -tpm /dev/tpmrm0 -key-file /var/lib/veil/master.sealed \
+  -cert /var/lib/veil/node.pem -key /var/lib/veil/node.tpmkey \
+  -backend-ca /etc/veil/server-ca.pem -peer-ca /etc/veil/device-ca.pem \
+  -state-file /var/lib/veil/state \
+  -peer-listen 0.0.0.0:2390 -peers 10.0.0.2:2390,10.0.0.3:2390 \
+  -ops-listen 127.0.0.1:9390
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+StateDirectory=veil
+ReadWritePaths=/var/lib/veil
+DeviceAllow=/dev/tpmrm0 rw
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Docker: the image is `FROM scratch` (only the static binary and the license
+texts) and runs as user 65532.
+
+```bash
+docker build --build-arg VERSION=v0.1.0 -t veil-proxy:v0.1.0 .
+sudo install -d -o 65532 -g 65532 -m 700 /var/lib/veil
+
+docker run -d --name veil-proxy --restart unless-stopped --network host \
+  --device /dev/tpmrm0 --group-add "$(getent group tss | cut -d: -f3)" \
+  -v /var/lib/veil:/var/lib/veil -v /etc/veil:/etc/veil:ro \
+  veil-proxy:v0.1.0 \
+  -upstream backend.veilplane.com:443 -tpm /dev/tpmrm0 \
+  -key-file /var/lib/veil/master.sealed -cert /var/lib/veil/node.pem -key /var/lib/veil/node.tpmkey \
+  -backend-ca /etc/veil/server-ca.pem -peer-ca /etc/veil/device-ca.pem \
+  -state-file /var/lib/veil/state -peer-listen 0.0.0.0:2390 -peers 10.0.0.2:2390,10.0.0.3:2390
+```
+
+- `--network host`: k3s on the host connects to `127.0.0.1:2389`, and peers
+  must reach each other.
+- The volume for `/var/lib/veil` is required: without the state file a new
+  container has no checkpoint of its own.
+- The TPM blobs are bound to the host's TPM, not to the container, so
+  containers can be recreated freely.
+- `docker stop` sends SIGTERM and waits 10 seconds by default, enough for the
+  graceful shutdown.
 
 ## 12. Backend contract
 

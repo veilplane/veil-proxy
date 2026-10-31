@@ -1,0 +1,7 @@
+# Only what the image build needs.
+*
+!go.mod
+!go.sum
+!*.go
+!LICENSE.md
+!NOTICE.md

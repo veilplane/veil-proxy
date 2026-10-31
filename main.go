@@ -66,6 +66,7 @@ import (
 	"github.com/tink-crypto/tink-go/v2/daead/subtle"
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -202,7 +203,13 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 	}
 	conn, err := grpc.Dial(cfg.upstream, grpc.WithTransportCredentials(creds),
 		// detect dead backend connections (the watch stream is long-lived)
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: true}))
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: true}),
+		// reconnect quickly after a backend restart (gRPC's default backoff grows to 2 minutes,
+		// longer than the API server's leader election tolerates)
+		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoff.Config{BaseDelay: 250 * time.Millisecond,
+			Multiplier: 1.6, Jitter: 0.2, MaxDelay: 3 * time.Second}, MinConnectTimeout: 5 * time.Second}),
+		// a snapshot load (Range over the whole key space) can be far larger than the 4 MB default
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxBackendMessage)))
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +290,7 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 	}
 	p.addr = lis.Addr().String()
 	p.self = "http://" + p.addr
-	p.srv = grpc.NewServer(grpc.MaxRecvMsgSize(16<<20), grpc.MaxSendMsgSize(16<<20),
+	p.srv = grpc.NewServer(grpc.MaxRecvMsgSize(16<<20), grpc.MaxSendMsgSize(maxBackendMessage),
 		grpc.UnaryInterceptor(p.metrics.unary), grpc.StreamInterceptor(p.metrics.stream))
 	pb.RegisterKVServer(p.srv, p)
 	pb.RegisterWatchServer(p.srv, p)
@@ -694,6 +701,10 @@ func newTLSSetup(cfg config) (*tlsSetup, error) {
 }
 
 // ---------------------------------------------------------------- crypto
+
+// maxBackendMessage limits responses from the backend (snapshot loads of the whole key space)
+// and to the API server (which pages, but can ask for everything at once).
+const maxBackendMessage = 2<<30 - 1
 
 const (
 	minSegmentSize = 32  // padded plaintext size of a key segment, at least

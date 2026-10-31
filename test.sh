@@ -8,6 +8,7 @@
 #
 # Needs a test build with the TPM simulator: go build -tags tpmsim -o veil-proxy-tpmsim .
 # Every instance gets its own simulated TPM (seeds 1, 2, 3 = three machines).
+# shellcheck disable=SC2046 # $(mtls ...) is split into flags on purpose
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-$HERE/.testrun}
@@ -58,16 +59,16 @@ cert etcd server-ca "IP:127.0.0.1"
 cert operator device-ca "IP:127.0.0.1"
 for n in node-a node-b node-c; do
   # key generated inside the node's TPM, only the CSR leaves it
-  "$PROXY" tpm-keygen -tpm simulator:$(seed $n) -out "$PKI/$n.tpmkey" -csr "$PKI/$n.csr" \
-    -uri "spiffe://veilplane.example/cluster/demo/node/$n" -ip 127.0.0.1
-  cert $n device-ca "IP:127.0.0.1,URI:spiffe://veilplane.example/cluster/demo/node/$n"
+  "$PROXY" tpm-keygen -tpm "simulator:$(seed "$n")" -out "$PKI/$n.tpmkey" -csr "$PKI/$n.csr" \
+    -uri "spiffe://veilplane.com/cluster/demo/node/$n" -ip 127.0.0.1
+  cert $n device-ca "IP:127.0.0.1,URI:spiffe://veilplane.com/cluster/demo/node/$n"
   # the shared master key, sealed by each node's own TPM
-  "$PROXY" tpm-seal -tpm simulator:$(seed $n) -in "$HERE/master.key" -out "$PKI/$n-master.sealed"
+  "$PROXY" tpm-seal -tpm "simulator:$(seed "$n")" -in "$HERE/master.key" -out "$PKI/$n-master.sealed"
 done
 head -1 "$PKI/node-a.tpmkey" | grep -q "VEIL TPM KEY" && head -1 "$PKI/node-a-master.sealed" | grep -q "VEIL TPM SEALED" \
   && ok "device keys and master key exist only as TPM blobs" || bad "TPM blobs"
-openssl x509 -in "$PKI/node-a.pem" -noout -ext subjectAltName 2> /dev/null | grep -q "spiffe://veilplane.example/cluster/demo/node/node-a" \
-  && ok "device certificate carries spiffe://veilplane.example/cluster/demo/node/node-a" || bad "device certificate"
+openssl x509 -in "$PKI/node-a.pem" -noout -ext subjectAltName 2> /dev/null | grep -q "spiffe://veilplane.com/cluster/demo/node/node-a" \
+  && ok "device certificate carries spiffe://veilplane.com/cluster/demo/node/node-a" || bad "device certificate"
 
 echo "== starting stack (simulated backend RTT: $DELAY)"
 "$ETCD_DIR/etcd" --data-dir etcd-data --listen-client-urls https://127.0.0.1:2379 $ETCD_TLS \

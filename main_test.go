@@ -604,9 +604,9 @@ func TestIdentityOf(t *testing.T) {
 	dir := t.TempDir()
 	ca := newTestCA(t, dir, "ca")
 	for uri, want := range map[string]string{
-		"spiffe://veilplane.example/cluster/c1/node/n1": "c1/n1",
-		"spiffe://veilplane.example/cluster/c1":         "",
-		"https://veilplane.example/cluster/c1/node/n1":  "",
+		"spiffe://veilplane.com/cluster/c1/node/n1": "c1/n1",
+		"spiffe://veilplane.com/cluster/c1":         "",
+		"https://veilplane.com/cluster/c1/node/n1":  "",
 		"": "",
 	} {
 		cf, _ := ca.issue(t, dir, "x", uri)
@@ -627,13 +627,13 @@ func TestIdentityOf(t *testing.T) {
 func TestCertRotation(t *testing.T) {
 	dir := t.TempDir()
 	ca := newTestCA(t, dir, "ca")
-	cf, kf := ca.issue(t, dir, "node", "spiffe://veilplane.example/cluster/c1/node/n1")
+	cf, kf := ca.issue(t, dir, "node", "spiffe://veilplane.com/cluster/c1/node/n1")
 	src := &certSource{certFile: cf, keyFile: kf}
 	first, err := src.get()
 	if err != nil {
 		t.Fatal(err)
 	}
-	ca.issue(t, dir, "node", "spiffe://veilplane.example/cluster/c1/node/n1")
+	ca.issue(t, dir, "node", "spiffe://veilplane.com/cluster/c1/node/n1")
 	later := time.Now().Add(time.Minute)
 	os.Chtimes(cf, later, later)
 	second, _ := src.get()
@@ -682,7 +682,7 @@ func TestAttackMTLS(t *testing.T) {
 	addr := startEtcdTLS(t, etcdDir, 23850, sc, sk, deviceCA.file)
 
 	device := func(name, cluster string, ca *testCA) config {
-		cf, kf := ca.issue(t, dir, name, "spiffe://veilplane.example/cluster/"+cluster+"/node/"+name)
+		cf, kf := ca.issue(t, dir, name, "spiffe://veilplane.com/cluster/"+cluster+"/node/"+name)
 		return config{listen: "127.0.0.1:0", upstream: addr, peerListen: "127.0.0.1:0",
 			stateFile: filepath.Join(t.TempDir(), "state"), master: bytes.Repeat([]byte{7}, 32), history: 10 * time.Minute,
 			certFile: cf, keyFile: kf, backendCA: serverCA.file, peerCA: deviceCA.file}

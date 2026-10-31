@@ -1,2 +1,10 @@
-.vscode
-.idea
+# Binaries
+/veil-proxy
+/veil-proxy-tpmsim
+
+# Created by test.sh: never commit a master key
+/master.key
+/.testrun/
+
+# Fuzzing corpus found locally (commit interesting cases deliberately)
+/testdata/fuzz/
