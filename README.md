@@ -11,8 +11,7 @@ This document describes how veil-proxy works, which formats it uses and what
 has to be kept in mind when changing it.
 
 Status: feature complete for kube-apiserver and k3s, not externally audited.
-Tested with k3s v1.33, etcd v3.5 as a stand-in backend and the Microsoft TPM
-2.0 reference implementation as a simulated TPM.
+Tested with k3s v1.33 and etcd v3.5 as a stand-in backend.
 
 ## Contents
 
@@ -23,9 +22,9 @@ Tested with k3s v1.33, etcd v3.5 as a stand-in backend and the Microsoft TPM
 5. Cryptography and data formats
 6. The verified replica
 7. Request handling
-8. Freshness, checkpoints and peers
+8. Freshness, checkpoints and checkpoint records
 9. mTLS and device identity
-10. TPM
+10. Key files
 11. Operations
 12. Backend contract
 13. Testing
@@ -42,15 +41,13 @@ Tested with k3s v1.33, etcd v3.5 as a stand-in backend and the Microsoft TPM
  | kube-apiserver / k3s                       |
  |      | etcd v3 gRPC, plaintext, localhost  |
  |      v                                     |
- | veil-proxy ---- verified replica (memory)  |      mTLS, etcd v3 gRPC
- |      |  \______________________________________> Veilplane backend
- |      |                                     |      (sees ciphertext only)
- |      +-- TPM: device key, sealed master key|
- |      +-- state file: verified checkpoints  |
- +------|-------------------------------------+
-        | mTLS: signed checkpoints
-        v
-   other veil-proxy instances of the same cluster
+ | veil-proxy ---- verified replica (memory)  |      mTLS, etcd v3 gRPC (outbound only)
+ |         \______________________________________> Veilplane backend
+ |                                            |      (sees ciphertext only)
+ | files: device key, master key (0600),      |               ^
+ |        state file (verified checkpoints)   |               | encrypted checkpoint records
+ +--------------------------------------------+               |
+                                    other veil-proxy instances of the same cluster
 ```
 
 The proxy has three jobs:
@@ -60,9 +57,10 @@ The proxy has three jobs:
 - Integrity and freshness: every instance follows the backend's complete change
   stream, checks each change and keeps a verified copy (the replica). Reads and
   watches are answered from that copy, never from backend answers.
-- Consistency between instances: instances exchange signed digests of their
-  state, which detects a backend that shows different histories to different
-  instances.
+- Consistency between instances: instances write encrypted checkpoint records
+  of their state into the key space, which detects a backend that shows
+  different histories to different instances. Instances never connect to each
+  other.
 
 The proxy does not protect availability. The backend can always refuse to
 serve. It can not make the proxy accept false data.
@@ -71,16 +69,12 @@ serve. It can not make the proxy accept false data.
 
 | File | Content |
 |---|---|
-| `main.go` | Entry point, startup and startup verification, mTLS, cryptography, key ranges, freshness and checkpoints, peer protocol, operations endpoints, gRPC services, write path |
+| `main.go` | Entry point, startup and startup verification, mTLS, cryptography, key ranges, freshness and checkpoints, checkpoint records, operations endpoints, gRPC services, write path |
 | `replica.go` | Verified replica: data model, verification of changes, state digest, history window, serving reads and watches |
-| `tpm.go` | TPM access: storage root key, device signing key, sealed master key |
-| `setup.go` | Subcommands for setting up a node (used by veilctl): `keygen`, `seal`, `sign`, `key-send`, `key-receive` |
-| `tpmsim.go` | Build tag `tpmsim` only: adds the `simulator:<seed>` TPM path for tests |
+| `setup.go` | Subcommands for setting up a node (used by veilctl): `keygen`, `sign`, `invite-seal`, `invite-open`; reading the master key file |
 | `main_test.go` | Unit tests, attack tests against a real etcd, mTLS tests, operations, load test, fuzz targets |
-| `setup_test.go` | Tests of the setup subcommands without TPM, including the master key transfer and its refusals |
-| `tpm_test.go` | Build tag `tpmsim` only: TPM tests with the simulator |
-| `test.sh` | End-to-end test with k3s, three instances, mTLS, TPM and a rollback attack |
-| `Dockerfile`, `.dockerignore` | Container image built `FROM scratch` |
+| `setup_test.go` | Tests of the setup subcommands, including the master key transfer and its refusals |
+| `test.sh` | End-to-end test with k3s, three instances, mTLS and a rollback attack |
 | `.github/workflows/` | CI (`test.yml`) and releases (`release.yml`) |
 | `LICENSE.md`, `NOTICE.md` | License of veil-proxy and of third-party code |
 
@@ -90,21 +84,19 @@ crypto, key ranges, freshness and checkpoints, operations, gRPC services.
 
 ## 3. Building and running
 
-Requirements: Go 1.24. The TPM simulator for tests additionally needs cgo and
-the OpenSSL development headers (`libssl-dev`).
+Requirements: Go 1.24. Linux on amd64 or arm64 is the supported platform.
 
 ```bash
 go mod tidy
 go build -trimpath -ldflags "-X main.buildVersion=v0.1.0" -o veil-proxy .   # production
 CGO_ENABLED=0 go build -trimpath -o veil-proxy .                            # fully static
-go build -tags tpmsim -o veil-proxy-tpmsim .                                # with TPM simulator, tests only
 ```
 
-The production binary does not contain the simulator (`tpmsim.go` is excluded
-by its build tag). Builds are reproducible: the same source and Go version give
-a bit-identical binary.
+Builds are reproducible: the same source and Go version give a bit-identical
+binary. Releases ship static binaries only; there is no container image,
+because the proxy runs as a systemd service next to the API server (section 11).
 
-### Development setup without TPM and TLS
+### Development setup without TLS
 
 ```bash
 ./veil-proxy -gen-key > master.key
@@ -113,8 +105,7 @@ k3s server --datastore-endpoint http://127.0.0.1:2389
 ```
 
 Without `-cert` the backend connection is plaintext and the proxy logs a
-warning. A hex master key file is accepted for development; production uses a
-TPM-sealed key.
+warning.
 
 ### Flags
 
@@ -122,15 +113,11 @@ TPM-sealed key.
 |---|---|---|
 | `-listen` | `127.0.0.1:2389` | Address kube-apiserver connects to (plaintext gRPC, keep it local) |
 | `-upstream` | `127.0.0.1:2379` | Backend: `host:port` (every address of the name is used) or a comma separated list of `host:port` |
-| `-key-file` | `master.key` | Master key: PEM `VEIL TPM SEALED` or 64 hex characters |
-| `-tpm` | `/dev/tpmrm0` | TPM device, used when `-key` or `-key-file` contain TPM blobs |
-| `-cert`, `-key` | | Device certificate (PEM) and its key: PEM `VEIL TPM KEY` or a PEM private key |
+| `-key-file` | `master.key` | Master key file: 64 hex characters, mode 0600 |
+| `-cert`, `-key` | | Device certificate (PEM) and its private key (PEM) |
 | `-backend-ca` | | CA bundle that signed the backend's server certificate (required with `-cert`) |
 | `-backend-name` | host of `-upstream` | Server name expected in the backend certificate |
-| `-peer-ca` | | CA bundle that signs device certificates (required for peers with `-cert`) |
-| `-peer-listen` | | Address to serve checkpoints to other instances |
-| `-peers` | | Comma separated `-peer-listen` addresses of other instances |
-| `-peers-file` | | File with more peer addresses (one per line); read again whenever it changes, so instances can be added without a restart (veilctl keeps it up to date) |
+| `-node` | node of the device certificate, else the host name | Name of this instance in checkpoint records |
 | `-state-file` | `veil.state` | Where verified checkpoints are persisted |
 | `-history` | `10m` | Verified history kept in memory; must exceed the API server's compaction interval (5 min by default) |
 | `-ops-listen` | `127.0.0.1:9390` | `/healthz`, `/readyz`, `/metrics`; empty disables |
@@ -144,50 +131,47 @@ TPM-sealed key.
 ### Setup subcommands
 
 Production nodes are set up with [veilctl](https://github.com/veilplane/veilctl), which calls
-these subcommands, so that all cryptography and TPM access stays in this program. All of them
-take `-tpm <device>`; `-tpm none` uses plain files instead (development and tests only).
+these subcommands, so that all cryptography stays in this program:
 
 ```bash
-veil-proxy keygen -out node.tpmkey -csr node.csr [-uri spiffe://...] [-ip ...] [-dns ...]
-veil-proxy seal -new -out master.sealed            # new random master key, sealed by the TPM
-veil-proxy seal -in master.hex -out master.sealed  # seal an existing hex key
-veil-proxy sign -key node.tpmkey < request.json    # base64 ECDSA-SHA256 (DER) signature
-veil-proxy key-send -cert node.pem -key node.tpmkey -peer-ca device-ca.pem \
-  -secret-file secret -key-file master.sealed -listen :2391 -timeout 1h
-veil-proxy key-receive -cert node.pem -key node.tpmkey -peer-ca device-ca.pem \
-  -secret-file secret -key-file master.sealed -from 10.0.0.5:2391
+veil-proxy keygen -out node.key -csr node.csr [-uri spiffe://...] [-ip ...] [-dns ...]
+veil-proxy sign -key node.key < request.json                # base64 ECDSA-SHA256 (DER) signature
+veil-proxy invite-seal -key-file master.key > secrets.json  # {fileSecret, serverSecret, box}
+veil-proxy invite-open -out master.key < secrets.json       # decrypt the master key of an invite
 ```
 
-`tpm-keygen` and `tpm-seal` are kept as old names of `keygen` and `seal`.
+A new master key for the first node of a cluster is 32 random bytes as hex
+(`veil-proxy -gen-key`, or veilctl writes it itself). Key files are written with
+mode 0600.
 
-### Master key transfer
+### Invites: the master key for a new node
 
-A new node of a cluster gets the master key directly from an existing node, never through
-the backend (`key-send` on the existing node, `key-receive` on the new one, see `setup.go`).
-The invite code that veilctl prints contains a random 32-byte secret that the backend never
-sees. Both sides authenticate with their device certificates (verified against the device
-CA, same trust domain and cluster). Because the hoster runs the device CA and could issue
-itself a certificate, the transfer is additionally bound to the secret:
+A new node of a cluster gets the master key from an invite file, never from the backend
+alone (`invite-seal` on the existing node, `invite-open` on the new one, see `setup.go`):
 
 ```
-auth key, enc key = HKDF-SHA256(secret, "veil key transfer v1 auth" / "... enc")
-request:  {node, nonce, mac = HMAC(auth key, "veil key request" | nonce | node | fp)}
-response: {nonce', box = AES-256-GCM(enc key, nonce', master key, aad = "veil key transfer" | nonce | fp)}
+key = HKDF-SHA256(file secret | server secret, "veil invite v1")      both secrets: 32 random bytes
+box = nonce | AES-256-GCM(key, nonce, master key, aad = "veil invite v1")
 ```
 
-`fp` is the SHA-256 of the requester's certificate as seen in the TLS handshake, so an
-answer is only usable on that connection. The sender hands the key out once and exits; five
-requests with a wrong secret also make it stop. The receiver seals the key with its own TPM.
+veilctl writes `box` and the file secret into the invite file and sends the server secret
+to the backend with the invite token. The backend hands the server secret out once, to the
+node that redeems the token, and deletes it then or when the token expires. So the backend
+alone (one half, no box) learns nothing, and the file alone is useless once used. Until it
+is used, the file must be treated like a password. Neither node accepts connections.
+
+The invite file also carries the inviting instance's state file, which the new instance
+uses to verify the backend at its first start (section 8).
 
 ## 4. Threat model
 
 Trusted:
 
-- The customer's control plane nodes, including root on them, the TPM and the
-  code of veil-proxy itself. veil-proxy does not try to protect against the
-  customer.
-- The master key, which only exists on customer nodes (sealed by their TPMs).
-- The CAs configured with `-backend-ca` and `-peer-ca`.
+- The customer's control plane nodes, including root on them, their disks and
+  backups, and the code of veil-proxy itself. veil-proxy does not try to
+  protect against the customer.
+- The master key, which only exists on customer nodes (section 10).
+- The CA configured with `-backend-ca`.
 
 Untrusted:
 
@@ -207,7 +191,9 @@ Non-goals:
 
 - Availability. The backend can stop serving at any time.
 - Protection of the worker nodes or of workloads. That is not the proxy's job.
-- Protection against a compromised customer node.
+- Protection against a compromised customer node, or against someone who
+  obtains a copy of its disk or backups. Root on a control plane node can read
+  every Secret through the API server anyway.
 
 ## 5. Cryptography and data formats
 
@@ -220,7 +206,6 @@ derived with HKDF-SHA256, salt empty, info `"veil-proxy v1 " + purpose`:
 |---|---|---|
 | `segment aes-siv` | 64 bytes | AES-256-SIV for key segments |
 | `value aes-gcm` | 32 bytes | AES-256-GCM for values |
-| `peer hmac` | 32 bytes | HMAC-SHA256 over checkpoints exchanged between instances |
 | `state digest` | 32 bytes | HMAC-SHA256 key of the replica's state digest |
 
 All instances of a cluster must use the same master key. Because the key
@@ -303,19 +288,6 @@ shown to clients and keys below `/veil/` cannot be written by clients.
 
 `/veil/read-index` is another reserved key. It is never written; a count-only
 range on it is the cheapest way to ask the backend for its current revision.
-
-### TPM blobs
-
-Both TPM-protected secrets are stored as PEM:
-
-```
------BEGIN VEIL TPM KEY-----      (or VEIL TPM SEALED)
-base64( len(public) (2 bytes) | TPM2B_PUBLIC | TPM2B_PRIVATE )
------END VEIL TPM KEY-----
-```
-
-The private part is encrypted by the TPM under its storage root key and can
-only be loaded by the same TPM.
 
 ## 6. The verified replica
 
@@ -501,7 +473,7 @@ Watches are served from the replica's history (`Watch`, `runWatcher` in
 - `Compact` first records the digest at the compaction revision as anchor
   (section 8). It refuses revisions outside the verified history.
 
-## 8. Freshness, checkpoints and peers
+## 8. Freshness, checkpoints and checkpoint records
 
 ### Freshness rule
 
@@ -509,9 +481,8 @@ Watches are served from the replica's history (`Watch`, `runWatcher` in
 backend call, the floor is read before sending; the response's revision must
 be at least that value (`check`). Comparing with the floor taken before the
 request avoids false alarms when responses overtake each other. The floor rises
-with every response, with every revision the replica applies and with every
-checkpoint received from a peer. A violation fails the request with
-`DataLoss` ("backend went back in time").
+with every response and with every revision the replica applies. A violation
+fails the request with `DataLoss` ("backend went back in time").
 
 ### Checkpoints and the state file
 
@@ -527,59 +498,66 @@ anchor <revision> <digest hex>
   atomically (temporary file and rename).
 - `anchor` is the digest at the last compaction revision this instance
   forwarded. The backend keeps history from the compaction revision on, so the
-  anchor stays verifiable even after a long outage, when `latest` has been
+  anchor stays verifiable after a longer outage, when `latest` has been
   compacted away.
 
 The file is not secret (the backend knows revisions, and the digest is keyed).
-It must be on persistent storage. Losing it is not data loss but means the
-instance needs a peer to start against a non-empty backend.
+It must be on persistent storage. A new instance gets the state file of an
+existing one with its invite (veilctl); without any state file, only an empty
+backend is accepted.
 
-### Peer protocol
+### Checkpoint records
 
-Instances serve their checkpoints over HTTP(S) on `-peer-listen`:
+The instances of a cluster never connect to each other. Instead, every
+instance writes its latest checkpoint once a minute to the reserved key
+`/veil/checkpoint/<node>`:
 
 ```
-GET /checkpoint      ->  "<revision> <digest hex> <signature hex>\n"   (latest)
-GET /digest?rev=N    ->  same format for revision N, 404 if outside the window
-signature = hex(HMAC-SHA256(peer key, "veil-proxy checkpoint <revision> <digest hex>"))
+<revision> <digest hex> <unix time of the writer>
 ```
 
-Every second each instance fetches `/checkpoint` from all configured peers
-(`pull`, 2 second timeout, in parallel). A valid checkpoint raises the floor
-and is handed to `replica.claim`: if the replica has a digest for that
-revision, it must match; if the revision lies ahead, it is stored and checked
-when reached. A replica that has failed keeps serving its last verified
-checkpoint, because that is exactly what other instances need to detect the
-same problem.
+The record is an ordinary value: encrypted with the master key, bound to its
+key and to its predecessor revision, so the backend can neither forge, move nor
+replay one. It travels through the backend like all data, so instances can sit
+behind NAT. Keys under `/veil/` are never shown to clients.
 
-Peers do not need to form a full mesh. A connected graph is enough: an instance
-between two diverging histories necessarily disagrees with at least one of
-them. With mTLS, peers are authenticated by device certificate and cluster id
-(section 9); the HMAC additionally protects the content.
+- **Spliced histories.** When the replica applies another instance's record
+  that names a revision it has verified with a different digest, the backend
+  showed different histories: the replica fails (`claim`). Records for
+  revisions not reached yet are kept and checked when reached.
+- **Hidden writes.** A backend that forks and hides the other instances'
+  records from this one makes them fall silent. Every instance tracks when it
+  last saw each other instance's record; after five minutes the instance is
+  logged as silent and counted in `veil_peers_silent`
+  (`veil_peer_checkpoint_age_seconds{node}` per instance). This is a warning,
+  not a failure: an instance that is simply down looks the same.
+- **Leaving.** `POST /leave` on the ops address (veilctl leave) deletes the
+  instance's record, so the others stop expecting it.
 
 ### Startup verification (`verifyAndLoad`)
 
-1. Read `latest` and `anchor` from the state file and fetch the checkpoints of
-   all reachable peers.
-2. Try the candidates in descending revision order: load the backend's
-   snapshot at that revision and compare digests.
+1. Read `latest` and `anchor` from the state file.
+2. Try them in descending revision order: load the backend's snapshot at that
+   revision and compare digests.
    - "compacted": try the next, older candidate.
    - "future revision": the backend is behind a verified revision. The replica
      fails ("backend went back in time").
    - digest mismatch: the replica fails (forged or forked history).
    - match: verified. The replica then follows the change stream from there and
      verifies every change up to the present.
-3. No candidate could be verified (none exists, or all were compacted):
-   - `-trust-backend`: the current backend state is accepted unverified;
-   - no state file: only an empty backend is accepted (first start of a new
-     cluster); a backend that holds data makes the replica fail;
-   - state file present: the replica fails.
+3. Both were compacted (long outage, or an old invite): the backend's current
+   state is accepted if it holds a checkpoint record whose revision is at least
+   that of `latest`. Such a record can only have been written by an instance of
+   the cluster after that point, so the state is not rolled back. Otherwise the
+   replica fails.
+4. No state file: with `-trust-backend` the current backend state is accepted
+   unverified; otherwise only an empty backend (first start of a new cluster).
 
 Infrastructure errors (backend unreachable) are retried every second.
 
 Recovery after a deliberate restore of a backend backup: all instances will
-refuse it. Delete the state files on all instances and start one instance with
-`-trust-backend`, then the others with that instance as peer.
+refuse it. Delete the state files on all instances, start one instance with
+`-trust-backend`, and set up the others again from it (invite).
 
 ## 9. mTLS and device identity
 
@@ -594,55 +572,41 @@ spiffe://<trust-domain>/cluster/<cluster-id>/node/<node-name>
 cluster id to route the connection to the customer's own emulated etcd. The
 proxy never sends a tenant id itself.
 
-Three TLS configurations exist (`newTLSSetup`):
-
-- backend client: roots from `-backend-ca`, server name from `-backend-name`
-  or the host of the (first) `-upstream` address;
-- peer server: requires a client certificate from `-peer-ca` with the same
-  trust domain and cluster id;
-- peer client: verifies the peer's certificate chain against `-peer-ca` and the
-  same cluster check. It does not match host names: the backend issues device
-  certificates with the `spiffe://` URI as the only name, so the identity is the
-  URI, not the address.
-
-Device certificates therefore need the extended key usages `clientAuth` and
-`serverAuth`.
+The only TLS connection is the one to the backend (`newTLSSetup`): roots from
+`-backend-ca`, server name from `-backend-name` or the host of the (first)
+`-upstream` address, client certificate from `-cert`/`-key`. Device
+certificates need the extended key usage `clientAuth`.
 
 `certSource` reloads certificate and key when their files change, so
 short-lived certificates can be rotated without restart. If a reload fails
 (for example during a half-finished rotation) the previous pair stays in use.
 
-## 10. TPM
+## 10. Key files
 
-`tpm.go` uses `github.com/google/go-tpm` (TPM 2.0 "direct" API).
+A node holds two secrets, both as plain files readable only by their owner
+(mode 0600, directory 0700):
 
-- Storage root key: re-created on every start with the standard ECC P-256 SRK
-  template (`tpm2.ECCSRKTemplate`) under the owner hierarchy. The same template
-  always gives the same key on the same TPM; it is never stored.
-- Device key: ECDSA P-256 signing key under the SRK, attributes `fixedTPM`,
-  `fixedParent`, `sensitiveDataOrigin`, `userWithAuth`, `sign`, `noDA`. The
-  private key never leaves the TPM. `tpmSigner` implements `crypto.Signer`;
-  it only signs SHA-256 digests, which is what TLS 1.3 with P-256 and CSR
-  signing use. On certificate rotation the old key handle is flushed.
-  `certSource` checks that the certificate's public key equals the TPM key.
-- Master key: sealed as a keyed-hash data object under the SRK, attributes
-  `fixedTPM`, `fixedParent`, `userWithAuth`, `noDA`, no authorization value and
-  no PCR policy. Unsealing happens once at startup.
+| File | Content |
+|---|---|
+| master key (`-key-file`) | 64 hex characters. Opens every key and value of the cluster. Identical on all nodes of a cluster. |
+| device key (`-key`) | ECDSA P-256 private key (PKCS#8 PEM) of the device certificate. Identifies this node to the backend. One per node. |
 
-There is deliberately no PCR (measured boot) binding: it would break on every
-kernel or firmware update and on arbitrary distributions. The protection is
-that blobs are useless on any other machine (copied disks, backups). Root on
-the node itself can use the TPM; that is the customer.
+The proxy reads the master key once at startup and warns if the file is
+readable by group or others. The device key is read with its certificate and
+re-read when either file changes.
 
-TPM commands are serialized with a mutex. The device is opened lazily on first
-use and closed on shutdown.
+This is the same protection Kubernetes gives its own secrets: the cluster CA,
+the service account signing key and the encryption-at-rest key are plain files
+on the control plane nodes. Consequences:
 
-For tests, `tpmsim.go` (build tag `tpmsim`) routes the TPM path
-`simulator:<seed>` to the Microsoft TPM 2.0 reference implementation from
-`github.com/google/go-tpm-tools/simulator`. With a fixed seed the simulated TPM
-derives the same SRK in every process, so a blob created by `keygen` in one
-process can be loaded by a later proxy process. Different seeds behave like
-different machines. The simulator allows only one open instance per process.
+- Whoever obtains a copy of these files (disk image, VM snapshot, backup) can
+  decrypt the cluster's data as stored by the backend, and with the device key
+  act as this node until its certificate expires or is revoked. Keep the state
+  directory out of backups that are less protected than the node itself.
+- Device certificates are short-lived and renewed daily by veilctl; a node can
+  be revoked at the backend at any time.
+- A copied device key used in parallel to the original writes conflicting
+  checkpoint records, which the other instances detect as a fork (section 8).
 
 ## 11. Operations
 
@@ -653,6 +617,7 @@ different machines. The simulator allows only one open instance per process.
 | `/healthz` | 200 while the process runs. Stays 200 after a detected attack, because a restart would not help. |
 | `/readyz` | 200 when the replica is loaded, verified and the gRPC server is serving. 503 during startup and after a detected attack, with the reason in the body. |
 | `/metrics` | Prometheus text format |
+| `POST /leave` | Deletes this instance's checkpoint record before it leaves the cluster (veilctl leave) |
 
 Metrics:
 
@@ -665,6 +630,8 @@ Metrics:
 | `veil_replica_tracked_keys` | gauge | Keys in the replica, including tombstones within the window |
 | `veil_backend_floor_revision` | gauge | Highest backend revision seen |
 | `veil_watch_streams` | gauge | Open watch streams from the API server |
+| `veil_peer_checkpoint_age_seconds{node}` | gauge | Per other instance: time since its checkpoint record last changed |
+| `veil_peers_silent` | gauge | Other instances without a new record for five minutes: down, or hidden by the backend. Alert on this. |
 | `veil_grpc_requests_total{method,code}` | counter | gRPC requests by method and status code |
 
 ### Logging
@@ -677,7 +644,7 @@ are only logged with `-v`.
 
 On SIGINT or SIGTERM the gRPC server stops gracefully (at most 5 seconds,
 because watches never end on their own), a final checkpoint is written, and the
-backend connection and the TPM are closed. The backend connection uses gRPC
+backend connection is closed. The backend connection uses gRPC
 keepalive (30 s interval, 10 s timeout) so that a dead connection is noticed
 and the watch is re-established.
 
@@ -685,10 +652,8 @@ and the watch is re-established.
 
 The proxy must not run inside the Kubernetes cluster it serves: the API server
 cannot start without it, and without the API server the pod would not be
-started. Run it as a systemd service or a container directly on the node, and
-point k3s at it with `--datastore-endpoint http://127.0.0.1:2389`.
-
-systemd:
+started. Run it as a systemd service directly on the node (veilctl writes this
+unit), and point k3s at it with `--datastore-endpoint http://127.0.0.1:2389`.
 
 ```ini
 [Unit]
@@ -699,48 +664,21 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/veil-proxy \
   -upstream backend.veilplane.com:443 -listen 127.0.0.1:2389 \
-  -tpm /dev/tpmrm0 -key-file /var/lib/veil/master.sealed \
-  -cert /var/lib/veil/node.pem -key /var/lib/veil/node.tpmkey \
-  -backend-ca /etc/veil/server-ca.pem -peer-ca /etc/veil/device-ca.pem \
+  -key-file /var/lib/veil/master.key \
+  -cert /var/lib/veil/node.pem -key /var/lib/veil/node.key \
+  -backend-ca /etc/veil/server-ca.pem \
   -state-file /var/lib/veil/state \
-  -peer-listen 0.0.0.0:2390 -peers 10.0.0.2:2390,10.0.0.3:2390 \
   -ops-listen 127.0.0.1:9390
 Restart=on-failure
 NoNewPrivileges=yes
 ProtectSystem=strict
 StateDirectory=veil
 ReadWritePaths=/var/lib/veil
-DeviceAllow=/dev/tpmrm0 rw
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-Docker: the image is `FROM scratch` (only the static binary and the license
-texts) and runs as user 65532.
-
-```bash
-docker build --build-arg VERSION=v0.1.0 -t veil-proxy:v0.1.0 .
-sudo install -d -o 65532 -g 65532 -m 700 /var/lib/veil
-
-docker run -d --name veil-proxy --restart unless-stopped --network host \
-  --device /dev/tpmrm0 --group-add "$(getent group tss | cut -d: -f3)" \
-  -v /var/lib/veil:/var/lib/veil -v /etc/veil:/etc/veil:ro \
-  veil-proxy:v0.1.0 \
-  -upstream backend.veilplane.com:443 -tpm /dev/tpmrm0 \
-  -key-file /var/lib/veil/master.sealed -cert /var/lib/veil/node.pem -key /var/lib/veil/node.tpmkey \
-  -backend-ca /etc/veil/server-ca.pem -peer-ca /etc/veil/device-ca.pem \
-  -state-file /var/lib/veil/state -peer-listen 0.0.0.0:2390 -peers 10.0.0.2:2390,10.0.0.3:2390
-```
-
-- `--network host`: k3s on the host connects to `127.0.0.1:2389`, and peers
-  must reach each other.
-- The volume for `/var/lib/veil` is required: without the state file a new
-  container has no checkpoint of its own.
-- The TPM blobs are bound to the host's TPM, not to the container, so
-  containers can be recreated freely.
-- `docker stop` sends SIGTERM and waits 10 seconds by default, enough for the
-  graceful shutdown.
 
 ## 12. Backend contract
 
@@ -788,9 +726,8 @@ a large key space in one `Range` works.
 ```bash
 go test .                                                     # unit tests, load test, fuzz seed corpus
 E2E_ETCD_DIR=/path/to/etcd-release go test -race -v .         # + attacks and mTLS against a real etcd
-E2E_ETCD_DIR=/path/to/etcd-release go test -tags tpmsim -v .  # + TPM tests with the simulator
 go test -run '^$' -fuzz '^FuzzDecKey$' -fuzztime 5m .         # fuzzing, one target at a time
-go build -tags tpmsim -o veil-proxy-tpmsim .
+go build -o veil-proxy .
 ETCD_DIR=/path/to/etcd-release K3S_BIN=/path/to/k3s ./test.sh [30ms]   # end-to-end, needs root for k3s
 ```
 
@@ -800,12 +737,12 @@ What is covered:
 |---|---|
 | Cryptography | Padmé values, padding round trip, determinism, prefix preservation, linkability, hidden lengths, tampering, canonical ciphertext keys, receipt format |
 | Replica rules | Valid history, replayed value, forged delete, replayed receipt, lease expiry, gaps, forged metadata, receipt without delete, digest consistency, fork claims, history trimming, compare evaluation |
-| Checkpoints | Persistence, peer exchange, forged peer checkpoints, rollback rule |
-| Against etcd (`E2E_ETCD_DIR`) | Two instances, replayed value, forged delete, new instance without checkpoint, fork with two backends, mTLS (valid, foreign CA, no certificate, untrusted server, other cluster as peer), operations endpoints and shutdown |
-| TPM (`-tags tpmsim`) | Seal and unseal, binding to one TPM, tampered blobs, TPM-backed TLS key, mTLS with TPM key and sealed master key against etcd |
+| Checkpoints | Persistence, checkpoint records (format, fork by a record, own record, hidden from clients), rollback rule |
+| Setup | Device key and CSR, signatures, key file modes, malformed master keys, invites (round trip, each half alone useless) |
+| Against etcd (`E2E_ETCD_DIR`) | Two instances, replayed value, forged delete, new instance without and with an inviting instance's checkpoint, fork (other history than the invite's), silent and leaving instances, mTLS (valid, foreign CA, no certificate, untrusted server), operations endpoints and shutdown |
 | Scale | 100,000 keys: apply, list one namespace, count all |
-| Fuzzing | `FuzzDecKey` (also checks canonical form), `FuzzOpenRecord`, `FuzzParseReceipt`, `FuzzParseRange`, `FuzzParseCheckpoint`, `FuzzDecodeTPMBlob` |
-| End-to-end (`test.sh`) | k3s on the proxy with mTLS and TPM keys: objects, controllers, pagination, watch, updates, cascading deletes, nothing readable in etcd, second instance, rollback attack against three instances including a new and a restarted one |
+| Fuzzing | `FuzzDecKey` (also checks canonical form), `FuzzOpenRecord`, `FuzzParseReceipt`, `FuzzParseRange`, `FuzzParseCheckpoint` |
+| End-to-end (`test.sh`) | k3s on the proxy with mTLS and keys from `keygen`: objects, controllers, pagination, watch, updates, cascading deletes, nothing readable in etcd, second instance, rollback attack against three instances including a new (with the state of an existing one) and a restarted one |
 
 The attack tests play the malicious backend by writing to etcd directly with a
 plain gRPC client.
@@ -814,10 +751,8 @@ plain gRPC client.
 
 `.github/workflows/test.yml` runs on pushes to `main`, on pull requests and as a
 reusable workflow from the release: lint (module verification, tidy check,
-gofmt, vet for both build variants, license headers), unit tests with race
-detector, integration tests with etcd and the TPM simulator, 60 seconds of
-fuzzing per target, the end-to-end test with k3s, and a Docker build for amd64
-and arm64 with a smoke test.
+gofmt, vet, license headers), unit tests with race detector, integration tests
+with etcd, 60 seconds of fuzzing per target and the end-to-end test with k3s.
 
 `.github/workflows/release.yml` runs on version tags. Versions follow Go module
 conventions (semantic versioning with a `v` prefix):
@@ -827,18 +762,18 @@ git tag v1.2.3 && git push origin v1.2.3
 git tag v1.3.0-rc.1 && git push origin v1.3.0-rc.1
 ```
 
-The workflow checks the tag format, runs all tests, builds the image for
-linux/amd64 and linux/arm64 with SBOM and build provenance, pushes it to
-`ghcr.io/<owner>/veil-proxy` and signs it with Sigstore (keyless, GitHub OIDC).
-Image tags: `vX.Y.Z` always; `vX.Y`, `vX` and `latest` for stable releases only;
-no `v0` tag. All actions are pinned to commit SHAs.
+The workflow checks the tag format, runs all tests and creates a GitHub release
+with static binaries for linux/amd64 and linux/arm64 (`veil-proxy-linux-amd64`,
+`veil-proxy-linux-arm64`, what veilctl's `install.sh` downloads), `checksums.txt`
+and a Sigstore bundle per file (keyless, GitHub OIDC). All actions are pinned to
+commit SHAs.
 
-Verifying an image:
+Verifying a binary:
 
 ```bash
-cosign verify ghcr.io/<owner>/veil-proxy:v1.2.3 \
-  --certificate-identity-regexp '^https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+cosign verify-blob --bundle veil-proxy-linux-amd64.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/veilplane/veil-proxy/.github/workflows/release.yml@refs/tags/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com veil-proxy-linux-amd64
 ```
 
 ## 15. Working on the code
@@ -877,7 +812,7 @@ which the backend misbehaves.
 
 ### Changing a format
 
-Key encryption, records, receipts, the digest and the checkpoint signature are
+Key encryption, records, receipts, the digest and checkpoint records are
 persisted or shared between instances. Changing any of them affects data that
 already exists and instances that run an older version:
 
@@ -895,7 +830,7 @@ already exists and instances that run an older version:
 Pure functions and replica rules: unit tests in `main_test.go`, building events
 with the `put`, `del` and `receipt` helpers and checking rejections with
 `mustReject`. Behaviour against a real backend: a `TestAttack...` test using
-`startEtcd` and `startProxy`. TPM: `tpm_test.go` with the `tpmsim` build tag.
+`startEtcd` and `startProxy`. Setup subcommands: `setup_test.go`.
 New parsers of untrusted input get a fuzz target.
 
 ## 16. Known limitations
@@ -905,8 +840,9 @@ New parsers of untrusted input get a fuzz target.
   of large values, and when and how much is written.
 - Keys attached to a lease (in Kubernetes mainly Events) can be deleted early by
   the backend, because lease expiry happens on the backend.
-- Fork detection needs the checkpoint exchange between instances. Instances
-  that cannot reach each other cannot detect different histories.
+- A backend that forks and hides the other instances' checkpoint records is only
+  reported (`veil_peers_silent`), not refused, because a stopped instance looks
+  the same. A single instance has nobody to compare with.
 - An instance without checkpoint accepts an empty backend. A backend that shows
   an empty state to all instances at the same time can pretend a new cluster.
 - Memory: every instance holds the decrypted key space in memory, roughly what

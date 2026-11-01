@@ -18,12 +18,12 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -341,37 +341,67 @@ func TestEvalCompare(t *testing.T) {
 
 // ---------------------------------------------------------------- checkpoints between instances
 
-func TestCheckpointPersistAndPeers(t *testing.T) {
+func TestCheckpointPersist(t *testing.T) {
 	s := testSealer(t, 1)
 	a := emptyReplica(t, s)
 	mustApply(t, a, 2, put(s, "/x", 2, 0, 2, 1, 0, "1"))
-	fa := newFreshness(s.peerMAC, filepath.Join(t.TempDir(), "a"), nil, a)
+	fa := newFreshness(filepath.Join(t.TempDir(), "a"), a)
 	fa.persist()
-	latest, _, ok, err := newFreshness(s.peerMAC, fa.file, nil, a).loadFile()
+	latest, _, ok, err := newFreshness(fa.file, a).loadFile()
 	if err != nil || !ok || latest.rev != 2 {
 		t.Fatalf("persisted checkpoint lost: %v %v %v", latest, ok, err)
 	}
+}
 
-	srv := httptest.NewServer(peerHandler(fa))
-	defer srv.Close()
-	fb := newFreshness(s.peerMAC, filepath.Join(t.TempDir(), "b"), []string{strings.TrimPrefix(srv.URL, "http://"), "127.0.0.1:1"}, emptyReplica(t, s))
-	if cps := fb.pull(); len(cps) != 1 || cps[0].rev != 2 || fb.floor() != 2 {
-		t.Fatalf("peer checkpoint not learned: %v floor=%d", cps, fb.floor())
+// Checkpoint records of other instances travel through the backend like all data: the
+// replica notes them, and a record whose digest differs from our own at that revision is a
+// fork.
+func TestCheckpointRecords(t *testing.T) {
+	s := testSealer(t, 1)
+	b := emptyReplica(t, s)
+	b.self = "b"
+	mustApply(t, b, 2, put(s, "/x", 2, 0, 2, 1, 0, "1"))
+	good, _ := b.digestAt(2)
+	at := time.Now().Add(-time.Hour)
+	rec := string(formatRecord(checkpoint{rev: 2, digest: good}, at))
+	mustApply(t, b, 3, put(s, checkpointPrefix+"a", 3, 0, 3, 1, 0, rec))
+	if b.newestRecord() != 2 {
+		t.Fatalf("newest record %d", b.newestRecord())
 	}
-	// A peer with a different master key (or a forger) is ignored.
-	evil := testSealer(t, 9)
-	ev := emptyReplica(t, evil)
-	mustApply(t, ev, 2, put(evil, "/x", 2, 0, 2, 1, 0, "1"))
-	esrv := httptest.NewServer(peerHandler(newFreshness(evil.peerMAC, filepath.Join(t.TempDir(), "e"), nil, ev)))
-	defer esrv.Close()
-	fc := newFreshness(s.peerMAC, filepath.Join(t.TempDir(), "c"), []string{strings.TrimPrefix(esrv.URL, "http://")}, emptyReplica(t, s))
-	if cps := fc.pull(); len(cps) != 0 || fc.floor() != 0 {
-		t.Fatal("forged checkpoint accepted")
+	if ages := b.peerAges(time.Now()); len(ages) != 1 || ages["a"] > time.Minute {
+		t.Fatalf("peer ages %v (seen counts, not the writer's clock)", ages)
+	}
+	// our own record is not a peer
+	mustApply(t, b, 4, put(s, checkpointPrefix+"b", 4, 0, 4, 1, 0, string(formatRecord(checkpoint{rev: 3, digest: good}, at))))
+	if ages := b.peerAges(time.Now()); len(ages) != 1 {
+		t.Fatalf("own record listed: %v", ages)
+	}
+	// a record that names revision 2 with another digest: two histories
+	forked := string(formatRecord(checkpoint{rev: 2, digest: [32]byte{1}}, at))
+	mustReject(t, b, 5, "fork", put(s, checkpointPrefix+"a", 5, 3, 3, 2, 0, forked))
+	// records are not visible to clients
+	resp, err := b.serveRange(&pb.RangeRequest{}, keyRange{all: true}, 0)
+	if err != nil || len(resp.Kvs) != 1 || string(resp.Kvs[0].Key) != "/x" {
+		t.Fatalf("records leaked to clients: %v %v", resp, err)
+	}
+}
+
+func TestRecordFormat(t *testing.T) {
+	cp := checkpoint{rev: 42, digest: [32]byte{7, 8}}
+	at := time.Unix(1_800_000_000, 0)
+	got, gotAt, err := parseRecord(formatRecord(cp, at))
+	if err != nil || got != cp || !gotAt.Equal(at) {
+		t.Fatalf("%v %v %v", got, gotAt, err)
+	}
+	for _, bad := range []string{"", "42", "42 xx 1", "x 0707 1", "42 " + strings.Repeat("0", 64) + " now"} {
+		if _, _, err := parseRecord([]byte(bad)); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
 	}
 }
 
 func TestFreshnessRejectsRollback(t *testing.T) {
-	f := newFreshness([]byte("k"), filepath.Join(t.TempDir(), "s"), nil, nil)
+	f := newFreshness(filepath.Join(t.TempDir(), "s"), nil)
 	before := f.floor()
 	if err := f.check(before, &pb.ResponseHeader{Revision: 100}); err != nil {
 		t.Fatal(err)
@@ -429,10 +459,36 @@ func dial(t *testing.T, addr string) pb.KVClient {
 	return pb.NewKVClient(conn)
 }
 
-func startProxy(t *testing.T, ctx context.Context, upstream string, peers ...string) *proxy {
+func startProxy(t *testing.T, ctx context.Context, upstream string, mods ...func(*config)) *proxy {
 	t.Helper()
-	p, err := start(ctx, config{listen: "127.0.0.1:0", upstream: upstream, peerListen: "127.0.0.1:0", peers: peers,
-		stateFile: filepath.Join(t.TempDir(), "state"), master: bytes.Repeat([]byte{7}, 32), history: 10 * time.Minute})
+	return startProxyWithState(t, ctx, upstream, "", mods...)
+}
+
+// startProxyAfter starts a new instance with the state of an existing one, as veilctl join
+// does with the state from the invite file.
+func startProxyAfter(t *testing.T, ctx context.Context, upstream string, from *proxy, mods ...func(*config)) *proxy {
+	t.Helper()
+	cp, ok := from.rep.checkpoint()
+	if !ok {
+		t.Fatal("no checkpoint to start from")
+	}
+	return startProxyWithState(t, ctx, upstream, "latest "+formatCheckpoint(cp)+"\nanchor 0 "+strings.Repeat("0", 64)+"\n", mods...)
+}
+
+var instances atomic.Int32
+
+func startProxyWithState(t *testing.T, ctx context.Context, upstream, state string, mods ...func(*config)) *proxy {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "state")
+	if state != "" {
+		os.WriteFile(file, []byte(state), 0o600)
+	}
+	cfg := config{listen: "127.0.0.1:0", upstream: upstream, node: fmt.Sprintf("i%d", instances.Add(1)),
+		stateFile: file, master: bytes.Repeat([]byte{7}, 32), history: 10 * time.Minute}
+	for _, m := range mods {
+		m(&cfg)
+	}
+	p, err := start(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +516,7 @@ func TestAttackNormalOperationTwoInstances(t *testing.T) {
 	defer cancel()
 	addr, _ := startEtcd(t, dir, 23790)
 	a := startProxy(t, ctx, addr)
-	b := startProxy(t, ctx, addr, a.peerAddr)
+	b := startProxy(t, ctx, addr)
 	ka, kb := dial(t, a.addr), dial(t, b.addr)
 
 	if _, err := ka.Put(ctx, &pb.PutRequest{Key: []byte("/registry/secrets/prod/db"), Value: []byte("v1")}); err != nil {
@@ -569,11 +625,11 @@ func TestAttackNewInstanceWithoutCheckpoint(t *testing.T) {
 	if _, err := dial(t, a.addr).Put(ctx, &pb.PutRequest{Key: []byte("/registry/x/y"), Value: []byte("data")}); err != nil {
 		t.Fatal(err)
 	}
-	lonely := startProxy(t, ctx, addr) // no peers, no state file
+	lonely := startProxy(t, ctx, addr) // no state file
 	eventually(t, dial(t, lonely.addr), "/registry/x/y", "no checkpoint")
-	withPeer := startProxy(t, ctx, addr, a.peerAddr)
-	if resp, err := dial(t, withPeer.addr).Range(ctx, &pb.RangeRequest{Key: []byte("/registry/x/y")}); err != nil || len(resp.Kvs) != 1 {
-		t.Fatalf("instance with a peer checkpoint should verify and serve: %v %v", resp, err)
+	invited := startProxyAfter(t, ctx, addr, a)
+	if resp, err := dial(t, invited.addr).Range(ctx, &pb.RangeRequest{Key: []byte("/registry/x/y")}); err != nil || len(resp.Kvs) != 1 {
+		t.Fatalf("instance with the checkpoint of an existing one should verify and serve: %v %v", resp, err)
 	}
 }
 
@@ -703,7 +759,7 @@ func startEtcdTLS(t *testing.T, dir string, port int, serverCert, serverKey, cli
 }
 
 // The backend (etcd with client-cert-auth) accepts only device certificates
-// of the right CA; peers accept only devices of their own cluster.
+// of the right CA.
 func TestAttackMTLS(t *testing.T) {
 	etcdDir := needEtcd(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -715,9 +771,9 @@ func TestAttackMTLS(t *testing.T) {
 
 	device := func(name, cluster string, ca *testCA) config {
 		cf, kf := ca.issue(t, dir, name, "spiffe://veilplane.com/cluster/"+cluster+"/node/"+name)
-		return config{listen: "127.0.0.1:0", upstream: addr, peerListen: "127.0.0.1:0",
+		return config{listen: "127.0.0.1:0", upstream: addr,
 			stateFile: filepath.Join(t.TempDir(), "state"), master: bytes.Repeat([]byte{7}, 32), history: 10 * time.Minute,
-			certFile: cf, keyFile: kf, backendCA: serverCA.file, peerCA: deviceCA.file}
+			certFile: cf, keyFile: kf, backendCA: serverCA.file}
 	}
 	mustStart := func(cfg config) *proxy {
 		p, err := start(ctx, cfg)
@@ -744,29 +800,21 @@ func TestAttackMTLS(t *testing.T) {
 		t.Fatalf("read over mTLS: %v %v", resp, err)
 	}
 
-	bcfg := device("node-b", "c1", deviceCA)
-	bcfg.peers = []string{a.peerAddr}
-	if b := mustStart(bcfg); len(b.fresh.pull()) != 1 {
-		t.Fatal("peer of the same cluster could not fetch the checkpoint over mTLS")
+	if a.node != "node-a" {
+		t.Fatalf("instance name from the certificate: %q", a.node)
 	}
-	xcfg := device("node-x", "c2", deviceCA)
-	xcfg.peers = []string{a.peerAddr}
-	if x := mustStart(xcfg); len(x.fresh.pull()) != 0 {
-		t.Fatal("a device of another cluster obtained a checkpoint")
-	}
-	t.Log("rejected as expected: peer of another cluster")
 
 	mustFail("certificate from a foreign CA", device("rogue", "c1", rogueCA))
 	noCert := device("plain", "c1", deviceCA)
-	noCert.certFile, noCert.keyFile, noCert.peerCA, noCert.peerListen = "", "", "", ""
+	noCert.certFile, noCert.keyFile = "", ""
 	mustFail("no client certificate", noCert)
 	wrongServer := device("node-c", "c1", deviceCA)
 	wrongServer.backendCA = deviceCA.file // the backend's certificate is not from this CA
 	mustFail("backend with an untrusted server certificate", wrongServer)
 }
 
-// Two backends play the role of one backend that shows two different
-// histories: each instance's history is consistent on its own.
+// A backend that shows a new instance another history than the one it was invited from:
+// the inviting instance's checkpoint does not verify there.
 func TestAttackFork(t *testing.T) {
 	dir := needEtcd(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -774,15 +822,54 @@ func TestAttackFork(t *testing.T) {
 	addr1, _ := startEtcd(t, dir, 23820)
 	addr2, _ := startEtcd(t, dir, 23830)
 	a := startProxy(t, ctx, addr1)
-	b := startProxy(t, ctx, addr2, a.peerAddr)
-	ka, kb := dial(t, a.addr), dial(t, b.addr)
-	if _, err := ka.Put(ctx, &pb.PutRequest{Key: []byte("/registry/pods/x/a"), Value: []byte("only in history 1")}); err != nil {
+	ka := dial(t, a.addr)
+	for i := 0; i < 3; i++ {
+		if _, err := ka.Put(ctx, &pb.PutRequest{Key: []byte("/registry/pods/x/a"), Value: []byte(fmt.Sprint(i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := startProxyAfter(t, ctx, addr2, a) // the "other history" is empty
+	eventually(t, dial(t, b.addr), "/registry/pods/x/a", "back in time")
+}
+
+// Instances write checkpoint records; the others see them, and one that stops writing is
+// reported as silent (down, or hidden by the backend).
+func TestAttackSilentPeer(t *testing.T) {
+	dir := needEtcd(t)
+	fast := func(c *config) { c.checkpointEvery, c.silentAfter = 300*time.Millisecond, 2*time.Second }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, _ := startEtcd(t, dir, 23890)
+	actx, acancel := context.WithCancel(ctx)
+	a := startProxy(t, actx, addr, fast)
+	b := startProxyAfter(t, ctx, addr, a, fast)
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		for i := 0; i < 100; i++ {
+			if ok() {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("timed out: %s", what)
+	}
+	waitFor("b sees a's record", func() bool { _, ok := b.rep.peerAges(time.Now())[a.node]; return ok })
+	if age := b.rep.peerAges(time.Now())[a.node]; age > b.silentAfter {
+		t.Fatalf("a is silent while running: %v", age)
+	}
+	acancel() // a stops
+	a.shutdown()
+	waitFor("a reported silent", func() bool { return b.rep.peerAges(time.Now())[a.node] > b.silentAfter })
+	if b.rep.err() != nil {
+		t.Fatalf("a silent instance must not stop the others: %v", b.rep.err())
+	}
+	// leaving removes the record: no more waiting for it
+	c := startProxyAfter(t, ctx, addr, b, fast)
+	waitFor("b sees c", func() bool { _, ok := b.rep.peerAges(time.Now())[c.node]; return ok })
+	if err := c.removeCheckpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := kb.Put(ctx, &pb.PutRequest{Key: []byte("/registry/pods/x/b"), Value: []byte("only in history 2")}); err != nil {
-		t.Fatal(err)
-	}
-	eventually(t, kb, "/registry/pods/x/b", "fork")
+	waitFor("c's record removed", func() bool { _, ok := b.rep.peerAges(time.Now())[c.node]; return !ok })
 }
 
 // ---------------------------------------------------------------- operations
@@ -837,7 +924,7 @@ func TestOpsEndpointsAndShutdown(t *testing.T) {
 	rev := p.rep.current()
 	cancel()
 	p.shutdown()
-	latest, _, ok, err := newFreshness(nil, state, nil, nil).loadFile()
+	latest, _, ok, err := newFreshness(state, nil).loadFile()
 	if err != nil || !ok || latest.rev != rev {
 		t.Fatalf("checkpoint after shutdown: %v (want rev %d) %v", latest, rev, err)
 	}
@@ -938,11 +1025,6 @@ func FuzzParseRange(f *testing.F) {
 func FuzzParseCheckpoint(f *testing.F) {
 	f.Add("5 " + strings.Repeat("ab", 32))
 	f.Fuzz(func(t *testing.T, s string) { parseCheckpoint(s) })
-}
-
-func FuzzDecodeTPMBlob(f *testing.F) {
-	f.Add([]byte{0, 2, 0, 0, 0, 0})
-	f.Fuzz(func(t *testing.T, b []byte) { decodeBlob(b) })
 }
 
 // A backend must not be able to create a second ciphertext spelling of the

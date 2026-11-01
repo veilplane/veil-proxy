@@ -31,11 +31,11 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -43,7 +43,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -55,7 +54,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,9 +81,9 @@ import (
 type config struct {
 	listen, upstream      string
 	stateFile             string
-	peerListen            string
-	peers                 []string
-	peersFile             string
+	node                  string        // name in checkpoint records (default: from the device certificate)
+	checkpointEvery       time.Duration // tests only (default: a minute)
+	silentAfter           time.Duration // tests only (default: five minutes)
 	master                []byte
 	delay, history        time.Duration
 	verbose, trustBackend bool
@@ -95,10 +93,8 @@ type config struct {
 	certFile, keyFile string
 	backendCA         string // CA that signed the backend's server certificate
 	backendName       string // expected server name, default: host of -upstream
-	peerCA            string // CA that signs device certificates
 
-	tpm       *tpmOpener // used when -key or -key-file hold TPM blobs
-	opsListen string     // /healthz, /readyz, /metrics
+	opsListen string // /healthz, /readyz, /metrics
 }
 
 // version is set at build time: -ldflags "-X main.buildVersion=v1.2.3"
@@ -116,7 +112,7 @@ func main() {
 	flag.StringVar(&cfg.listen, "listen", "127.0.0.1:2389", "address kube-apiserver connects to")
 	flag.StringVar(&cfg.upstream, "upstream", "127.0.0.1:2379", "hosted etcd-compatible backend: host:port (all addresses of the name are used), or a comma separated list of host:port")
 	flag.StringVar(&cfg.stateFile, "state-file", "veil.state", "where verified checkpoints are persisted")
-	flag.StringVar(&cfg.peerListen, "peer-listen", "", "address to serve signed checkpoints to the other instances, e.g. 0.0.0.0:2390")
+	flag.StringVar(&cfg.node, "node", "", "name of this instance in checkpoint records (default: node of the device certificate, else the host name)")
 	flag.DurationVar(&cfg.delay, "delay", 0, "simulated round trip time to the backend, e.g. 30ms")
 	flag.DurationVar(&cfg.history, "history", 10*time.Minute, "how much verified history to keep (must exceed the API server's compaction interval)")
 	flag.BoolVar(&cfg.verbose, "v", false, "log every request with its plaintext key")
@@ -125,13 +121,9 @@ func main() {
 	flag.StringVar(&cfg.keyFile, "key", "", "private key of the device certificate (PEM)")
 	flag.StringVar(&cfg.backendCA, "backend-ca", "", "CA bundle (PEM) that signed the backend's server certificate")
 	flag.StringVar(&cfg.backendName, "backend-name", "", "server name expected in the backend certificate (default: host of -upstream)")
-	flag.StringVar(&cfg.peerCA, "peer-ca", "", "CA bundle (PEM) that signs device certificates, used to authenticate peers")
 	flag.StringVar(&cfg.opsListen, "ops-listen", "127.0.0.1:9390", "address for /healthz, /readyz and /metrics (empty: off)")
-	keyFile := flag.String("key-file", "master.key", "master key: TPM-sealed (VEIL TPM SEALED) or 64 hex chars (development)")
-	tpmPath := flag.String("tpm", "/dev/tpmrm0", "TPM device, used when -key or -key-file are TPM blobs")
+	keyFile := flag.String("key-file", "master.key", "master key file: 64 hex characters, mode 0600")
 	genKey := flag.Bool("gen-key", false, "print a new random master key and exit")
-	peers := flag.String("peers", "", "comma separated peer-listen addresses of the other instances")
-	flag.StringVar(&cfg.peersFile, "peers-file", "", "file with more peer addresses (one per line), read again when it changes")
 	logFormat := flag.String("log-format", "json", "json or text")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -154,12 +146,10 @@ func main() {
 	}
 	slog.SetDefault(slog.New(h).With("version", buildVersion)) // also routes the log package through slog
 
-	cfg.tpm = &tpmOpener{path: *tpmPath}
 	var err error
-	if cfg.master, err = loadMasterKey(*keyFile, cfg.tpm); err != nil {
+	if cfg.master, err = loadMasterKey(*keyFile); err != nil {
 		fatal("master key", err)
 	}
-	cfg.peers = splitList(*peers)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -260,12 +250,18 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 		verbose: cfg.verbose,
 		metrics: &metrics{},
 	}
-	p.fresh = newFreshness(s.peerMAC, cfg.stateFile, cfg.peers, p.rep)
-	p.fresh.peersFile = cfg.peersFile
-	p.closers = append(p.closers, conn.Close)
-	if cfg.tpm != nil {
-		p.closers = append(p.closers, cfg.tpm.close)
+	p.fresh = newFreshness(cfg.stateFile, p.rep)
+	p.node = cfg.node
+	if ts != nil && p.node == "" {
+		p.node = ts.id.node
 	}
+	if p.node == "" {
+		p.node, _ = os.Hostname()
+	}
+	p.rep.self = p.node
+	p.checkpointEvery = cmp.Or(cfg.checkpointEvery, defaultCheckpointEvery)
+	p.silentAfter = cmp.Or(cfg.silentAfter, defaultSilentAfter)
+	p.closers = append(p.closers, conn.Close)
 	if cfg.opsListen != "" {
 		ln, err := net.Listen("tcp", cfg.opsListen)
 		if err != nil {
@@ -275,28 +271,6 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 		ops := &http.Server{Handler: opsHandler(p)}
 		go ops.Serve(ln)
 		p.closers = append(p.closers, ops.Close)
-	}
-	if ts != nil && ts.peerClient != nil {
-		p.fresh.scheme = "https"
-		p.fresh.client.Transport = &http.Transport{TLSClientConfig: ts.peerClient}
-	} else if ts != nil && (cfg.peerListen != "" || len(cfg.peers) > 0 || cfg.peersFile != "") {
-		return nil, errors.New("-peer-ca is required for peers when mTLS is used")
-	}
-
-	if cfg.peerListen != "" {
-		ln, err := net.Listen("tcp", cfg.peerListen)
-		if err != nil {
-			return nil, err
-		}
-		p.peerAddr = ln.Addr().String()
-		srv := &http.Server{Handler: peerHandler(p.fresh)}
-		if ts != nil {
-			srv.TLSConfig = ts.peerServer
-			go srv.ServeTLS(ln, "", "")
-		} else {
-			go srv.Serve(ln)
-		}
-		p.closers = append(p.closers, srv.Close)
 	}
 	for {
 		err := p.verifyAndLoad(ctx, cfg.trustBackend)
@@ -318,7 +292,7 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 	if p.rep.err() == nil {
 		go p.rep.follow(ctx, p)
 	}
-	go p.fresh.loop(ctx)
+	go p.checkpointLoop(ctx)
 
 	lis, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
@@ -341,7 +315,7 @@ func start(ctx context.Context, cfg config) (*proxy, error) {
 }
 
 // shutdown stops serving (waiting briefly for running requests), persists a
-// final checkpoint and releases backend connection and TPM. Safe to call twice.
+// final checkpoint and releases the backend connection. Safe to call twice.
 func (p *proxy) shutdown() {
 	p.stopOnce.Do(func() {
 		if p.srv != nil {
@@ -423,6 +397,19 @@ func opsHandler(p *proxy) http.Handler {
 		}
 		fmt.Fprintln(w, "ok")
 	})
+	// POST /leave removes this instance's checkpoint record (veilctl leave), so the other
+	// instances stop expecting it. Only on the local ops address.
+	mux.HandleFunc("/leave", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := p.removeCheckpoint(r.Context()); err != nil {
+			http.Error(w, status.Convert(err).Message(), http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintln(w, "ok")
+	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		failed := 0
 		if p.rep.err() != nil {
@@ -438,6 +425,21 @@ func opsHandler(p *proxy) http.Handler {
 		fmt.Fprintf(w, "# TYPE veil_replica_tracked_keys gauge\nveil_replica_tracked_keys %d\n", keys)
 		fmt.Fprintf(w, "# TYPE veil_backend_floor_revision gauge\nveil_backend_floor_revision %d\n", p.fresh.floor())
 		fmt.Fprintf(w, "# TYPE veil_watch_streams gauge\nveil_watch_streams %d\n", p.metrics.watches.Load())
+		ages := p.rep.peerAges(time.Now())
+		peers := make([]string, 0, len(ages))
+		silent := 0
+		for n, a := range ages {
+			peers = append(peers, n)
+			if a > p.silentAfter {
+				silent++
+			}
+		}
+		sort.Strings(peers)
+		fmt.Fprintf(w, "# TYPE veil_peers_silent gauge\nveil_peers_silent %d\n", silent)
+		fmt.Fprintf(w, "# TYPE veil_peer_checkpoint_age_seconds gauge\n")
+		for _, n := range peers {
+			fmt.Fprintf(w, "veil_peer_checkpoint_age_seconds{node=%q} %.0f\n", n, ages[n].Seconds())
+		}
 		p.metrics.mu.Lock()
 		keysSorted := make([]string, 0, len(p.metrics.requests))
 		for k := range p.metrics.requests {
@@ -463,9 +465,8 @@ func (p *proxy) verifyAndLoad(ctx context.Context, trustBackend bool) error {
 	if err != nil {
 		return err
 	}
-	peerCps := p.fresh.pull()
 	var cands []checkpoint
-	for _, c := range append(append(peerCps, own), anchor) {
+	for _, c := range []checkpoint{own, anchor} {
 		if c.rev > 0 {
 			cands = append(cands, c)
 			p.fresh.observe(c.rev)
@@ -507,10 +508,22 @@ func (p *proxy) verifyAndLoad(ctx context.Context, trustBackend bool) error {
 			log.Printf("first start: the backend is empty (revision %d), nothing to verify", p.rep.current())
 			return nil
 		}
-		p.rep.fail(dataLoss("the backend holds data, but there is no checkpoint (own or peer) to verify it; start once with -trust-backend if this is intended"))
+		p.rep.fail(dataLoss("the backend holds data, but there is no checkpoint to verify it (a new instance needs the state of an existing one, e.g. from an invite); start once with -trust-backend if this is intended"))
 		return nil
 	}
-	p.rep.fail(dataLoss("no verifiable checkpoint left (the backend compacted past all of them); restart with -trust-backend to accept its state"))
+	// Every checkpoint was compacted away (the instance was off for a while, or it was set up
+	// from an older invite). The backend's current state is still accepted if it carries a
+	// checkpoint record, written by an instance of this cluster with the master key, that is at
+	// least as new as the newest checkpoint known here: then it is not a rolled back state.
+	// Forks after that point are found by the records the instances keep writing.
+	if err := p.rep.load(ctx, p.kv, 0); err != nil {
+		return err
+	}
+	if newest := p.rep.newestRecord(); newest >= cands[0].rev {
+		log.Printf("all checkpoints compacted; backend state verified by a checkpoint record at revision %d (>= %d)", newest, cands[0].rev)
+		return nil
+	}
+	p.rep.fail(dataLoss("no verifiable checkpoint left (the backend compacted past all of them and holds no newer checkpoint record); restart with -trust-backend to accept its state"))
 	return nil
 }
 
@@ -541,68 +554,12 @@ func identityOf(cert *x509.Certificate) (identity, error) {
 
 // certSource hands out the device certificate and reloads it when the files
 // change, so short-lived certificates can be rotated without a restart.
-//
-// The key file is either a PEM private key (development) or a TPM blob
-// ("VEIL TPM KEY"); then every TLS handshake is signed inside the TPM.
 type certSource struct {
 	certFile, keyFile string
-	tpm               *tpmOpener
 
-	mu     sync.Mutex
-	cert   *tls.Certificate
-	mod    time.Time
-	signer *tpmSigner // current TPM key, flushed when rotated
-}
-
-func (c *certSource) load() (tls.Certificate, error) {
-	keyPEM, err := os.ReadFile(c.keyFile)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	block, _ := pem.Decode(keyPEM)
-	if block == nil || block.Type != pemTPMKey {
-		return tls.LoadX509KeyPair(c.certFile, c.keyFile)
-	}
-	if c.tpm == nil {
-		return tls.Certificate{}, errors.New("TPM key given but no TPM configured")
-	}
-	dev, err := c.tpm.get()
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	certPEM, err := os.ReadFile(c.certFile)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	var kp tls.Certificate
-	for rest := certPEM; ; {
-		var b *pem.Block
-		if b, rest = pem.Decode(rest); b == nil {
-			break
-		}
-		if b.Type == "CERTIFICATE" {
-			kp.Certificate = append(kp.Certificate, b.Bytes)
-		}
-	}
-	if len(kp.Certificate) == 0 {
-		return tls.Certificate{}, fmt.Errorf("%s: no certificate", c.certFile)
-	}
-	if kp.Leaf, err = x509.ParseCertificate(kp.Certificate[0]); err != nil {
-		return tls.Certificate{}, err
-	}
-	s, err := dev.signer(block.Bytes)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	if !publicKeysEqual(kp.Leaf.PublicKey, s.Public()) {
-		dev.flush(s.h)
-		return tls.Certificate{}, errors.New("certificate does not belong to the TPM key")
-	}
-	if c.signer != nil {
-		dev.flush(c.signer.h)
-	}
-	c.signer, kp.PrivateKey = s, s
-	return kp, nil
+	mu   sync.Mutex
+	cert *tls.Certificate
+	mod  time.Time
 }
 
 func (c *certSource) get() (*tls.Certificate, error) {
@@ -623,7 +580,7 @@ func (c *certSource) get() (*tls.Certificate, error) {
 	if c.cert != nil && !mod.After(c.mod) {
 		return c.cert, nil
 	}
-	kp, err := c.load()
+	kp, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
 	if err != nil {
 		if c.cert != nil { // e.g. caught mid-rotation: keep the old pair for now
 			log.Printf("mTLS: cannot reload certificate (%v), keeping the previous one", err)
@@ -665,10 +622,8 @@ func loadPool(file string) (*x509.CertPool, error) {
 }
 
 type tlsSetup struct {
-	id         identity
-	backend    *tls.Config // client side, towards the backend
-	peerServer *tls.Config // serving checkpoints to peers
-	peerClient *tls.Config // fetching checkpoints from peers
+	id      identity
+	backend *tls.Config // client side, towards the backend
 }
 
 // newTLSSetup returns nil without -cert (plaintext development mode).
@@ -679,7 +634,7 @@ func newTLSSetup(cfg config) (*tlsSetup, error) {
 	if cfg.keyFile == "" || cfg.backendCA == "" {
 		return nil, errors.New("-cert needs -key and -backend-ca")
 	}
-	src := &certSource{certFile: cfg.certFile, keyFile: cfg.keyFile, tpm: cfg.tpm}
+	src := &certSource{certFile: cfg.certFile, keyFile: cfg.keyFile}
 	cert, err := src.get()
 	if err != nil {
 		return nil, fmt.Errorf("device certificate: %v", err)
@@ -699,56 +654,6 @@ func newTLSSetup(cfg config) (*tlsSetup, error) {
 		ServerName:           cfg.backendName, // default: host of the (first) -upstream address
 		GetClientCertificate: clientCert,
 	}}
-	if cfg.peerCA == "" {
-		return ts, nil
-	}
-	peerCA, err := loadPool(cfg.peerCA)
-	if err != nil {
-		return nil, err
-	}
-	// Peers must hold a device certificate of the same cluster. The chain is
-	// verified by crypto/tls before this runs.
-	sameCluster := func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return errors.New("peer sent no certificate")
-		}
-		pid, err := identityOf(cs.PeerCertificates[0])
-		if err != nil {
-			return err
-		}
-		if pid.domain != id.domain || pid.cluster != id.cluster {
-			return fmt.Errorf("peer belongs to cluster %q, not %q", pid.cluster, id.cluster)
-		}
-		return nil
-	}
-	ts.peerServer = &tls.Config{
-		MinVersion:       tls.VersionTLS13,
-		ClientAuth:       tls.RequireAndVerifyClientCert,
-		ClientCAs:        peerCA,
-		GetCertificate:   func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return src.get() },
-		VerifyConnection: sameCluster,
-	}
-	// Device certificates name no hosts (the backend issues them with the spiffe:// URI only),
-	// so the client verifies the chain itself instead of matching the address.
-	ts.peerClient = &tls.Config{
-		MinVersion:           tls.VersionTLS13,
-		InsecureSkipVerify:   true, // replaced by the chain check in VerifyConnection
-		GetClientCertificate: clientCert,
-		VerifyConnection: func(cs tls.ConnectionState) error {
-			if len(cs.PeerCertificates) == 0 {
-				return errors.New("peer sent no certificate")
-			}
-			inter := x509.NewCertPool()
-			for _, c := range cs.PeerCertificates[1:] {
-				inter.AddCert(c)
-			}
-			if _, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: peerCA, Intermediates: inter,
-				KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
-				return err
-			}
-			return sameCluster(cs)
-		},
-	}
 	return ts, nil
 }
 
@@ -767,7 +672,6 @@ const (
 type sealer struct {
 	seg       *subtle.AESSIV // key segments: deterministic, AES-256-SIV
 	val       cipher.AEAD    // values: AES-256-GCM, random nonce
-	peerMAC   []byte         // authenticates checkpoints between instances
 	digestKey []byte         // keys the state digest
 }
 
@@ -779,7 +683,7 @@ func newSealer(master []byte) (*sealer, error) {
 		}
 		return k
 	}
-	s := &sealer{peerMAC: derive("peer hmac", 32), digestKey: derive("state digest", 32)}
+	s := &sealer{digestKey: derive("state digest", 32)}
 	var err error
 	if s.seg, err = subtle.NewAESSIV(derive("segment aes-siv", subtle.AESSIVKeySize)); err != nil {
 		return nil, err
@@ -992,25 +896,17 @@ func parseRange(key, end []byte) (keyRange, error) {
 
 // ---------------------------------------------------------------- freshness and checkpoints
 
-// freshness tracks the highest backend revision seen (the floor), persists
-// verified checkpoints and exchanges them with the other instances.
+// freshness tracks the highest backend revision seen (the floor) and persists
+// verified checkpoints. The other instances learn them from checkpoint records
+// (see checkpointLoop).
 //
 // Rule: a request sent after revision R was seen must be answered with a
 // revision >= R. Comparing against the floor taken *before* the request avoids
 // false alarms when responses overtake each other.
 type freshness struct {
-	hwm    atomic.Int64
-	mac    []byte
-	file   string
-	peers  []string
-	client *http.Client
-
-	peersFile string // -peers-file: re-read when it changes
-	peersMu   sync.Mutex
-	peersMod  time.Time
-	extra     []string // -peers plus the file
-	scheme    string   // "https" with mTLS
-	rep       *replica
+	hwm  atomic.Int64
+	file string
+	rep  *replica
 
 	mu     sync.Mutex
 	last   checkpoint // last persisted own checkpoint
@@ -1018,8 +914,8 @@ type freshness struct {
 	saved  string
 }
 
-func newFreshness(mac []byte, file string, peers []string, rep *replica) *freshness {
-	return &freshness{mac: mac, file: file, peers: peers, rep: rep, scheme: "http", client: &http.Client{Timeout: 2 * time.Second}}
+func newFreshness(file string, rep *replica) *freshness {
+	return &freshness{file: file, rep: rep}
 }
 
 func (f *freshness) floor() int64 { return f.hwm.Load() }
@@ -1043,12 +939,6 @@ func (f *freshness) check(before int64, h *pb.ResponseHeader) error {
 	}
 	f.observe(h.Revision)
 	return nil
-}
-
-func (f *freshness) sign(c checkpoint) string {
-	m := hmac.New(sha256.New, f.mac)
-	fmt.Fprintf(m, "veil-proxy checkpoint %d %x", c.rev, c.digest)
-	return hex.EncodeToString(m.Sum(nil))
 }
 
 func formatCheckpoint(c checkpoint) string { return fmt.Sprintf("%d %x", c.rev, c.digest) }
@@ -1123,139 +1013,122 @@ func (f *freshness) persist() {
 	f.saved = content
 }
 
-// peerHandler serves signed checkpoints: /checkpoint (latest) and
-// /digest?rev=N (from the verified history window).
-func peerHandler(f *freshness) http.Handler {
-	mux := http.NewServeMux()
-	reply := func(w http.ResponseWriter, c checkpoint) {
-		fmt.Fprintf(w, "%s %s\n", formatCheckpoint(c), f.sign(c))
-	}
-	mux.HandleFunc("/checkpoint", func(w http.ResponseWriter, _ *http.Request) {
-		c, ok := f.rep.checkpoint()
-		if !ok {
-			http.Error(w, "not available", http.StatusServiceUnavailable)
-			return
-		}
-		reply(w, c)
-	})
-	mux.HandleFunc("/digest", func(w http.ResponseWriter, r *http.Request) {
-		rev, _ := strconv.ParseInt(r.URL.Query().Get("rev"), 10, 64)
-		d, ok := f.rep.digestAt(rev)
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		reply(w, checkpoint{rev: rev, digest: d})
-	})
-	return mux
+// ---------------------------------------------------------------- checkpoint records
+//
+// Every instance writes its latest verified checkpoint to /veil/checkpoint/<node> once a
+// minute: "<revision> <digest> <unix time>", encrypted and bound to the key like every value,
+// so only holders of the master key can write one. The records travel through the backend
+// like all data; no instance accepts connections from the others, so they can sit behind NAT.
+//
+//   - A record of another instance that names a revision this instance has verified with a
+//     different digest proves that the backend shows different histories (fork). The replica
+//     checks this for every record it applies (replica.claim).
+//   - A backend that forks and hides the other instances' records instead makes them fall
+//     silent: an instance whose record is older than five minutes is logged and counted in
+//     veil_peers_silent.
+//   - After a long downtime, a record newer than the instance's own checkpoint proves that the
+//     backend state is not rolled back (verifyAndLoad).
+
+const (
+	checkpointPrefix = "/veil/checkpoint/"
+)
+
+const (
+	defaultCheckpointEvery = time.Minute
+	defaultSilentAfter     = 5 * time.Minute
+)
+
+func formatRecord(c checkpoint, at time.Time) []byte {
+	return []byte(fmt.Sprintf("%d %x %d", c.rev, c.digest, at.Unix()))
 }
 
-func (f *freshness) fetch(peer, path string) (checkpoint, bool) {
-	resp, err := f.client.Get(f.scheme + "://" + peer + path)
+func parseRecord(b []byte) (checkpoint, time.Time, error) {
+	f := strings.Fields(string(b))
+	if len(f) != 3 {
+		return checkpoint{}, time.Time{}, errors.New("malformed checkpoint record")
+	}
+	c, err := parseCheckpoint(f[0] + " " + f[1])
 	if err != nil {
-		return checkpoint{}, false
+		return checkpoint{}, time.Time{}, err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	if resp.StatusCode != http.StatusOK {
-		return checkpoint{}, false
-	}
-	fields := strings.Fields(string(body))
-	if len(fields) != 3 {
-		return checkpoint{}, false
-	}
-	c, err := parseCheckpoint(fields[0] + " " + fields[1])
-	if err != nil || !hmac.Equal([]byte(fields[2]), []byte(f.sign(c))) {
-		log.Printf("peer %s: invalid checkpoint signature, ignored", peer)
-		return checkpoint{}, false
-	}
-	return c, true
-}
-
-// peerList returns -peers plus the addresses in -peers-file (one per line or comma
-// separated), which is read again whenever it changes, so instances can be added without a
-// restart. A missing file means no extra peers.
-func (f *freshness) peerList() []string {
-	if f.peersFile == "" {
-		return f.peers
-	}
-	f.peersMu.Lock()
-	defer f.peersMu.Unlock()
-	st, err := os.Stat(f.peersFile)
+	sec, err := strconv.ParseInt(f[2], 10, 64)
 	if err != nil {
-		return f.peers
+		return checkpoint{}, time.Time{}, err
 	}
-	if !st.ModTime().Equal(f.peersMod) {
-		raw, err := os.ReadFile(f.peersFile)
-		if err == nil {
-			list := append([]string(nil), f.peers...)
-			for _, a := range splitList(strings.ReplaceAll(string(raw), "\n", ",")) {
-				if !slices.Contains(list, a) {
-					list = append(list, a)
-				}
-			}
-			f.extra, f.peersMod = list, st.ModTime()
-		}
-	}
-	if f.extra == nil {
-		return f.peers
-	}
-	return f.extra
+	return c, time.Unix(sec, 0), nil
 }
 
-// pull fetches the latest checkpoint of every reachable peer, raises the floor
-// and hands the digests to the replica for fork detection.
-func (f *freshness) pull() []checkpoint {
-	var mu sync.Mutex
-	var out []checkpoint
-	var wg sync.WaitGroup
-	for _, peer := range f.peerList() {
-		wg.Add(1)
-		go func(peer string) {
-			defer wg.Done()
-			if c, ok := f.fetch(peer, "/checkpoint"); ok {
-				f.observe(c.rev)
-				f.rep.claim(c)
-				mu.Lock()
-				out = append(out, c)
-				mu.Unlock()
-			}
-		}(peer)
-	}
-	wg.Wait()
-	return out
-}
-
-func (f *freshness) loop(ctx context.Context) {
+// checkpointLoop persists the checkpoint every second, writes the checkpoint record every
+// minute and reports instances that fell silent.
+func (p *proxy) checkpointLoop(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
+	var lastWrite time.Time
+	silent := map[string]bool{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			f.pull()
-			f.persist()
+		case now := <-t.C:
+			p.fresh.persist()
+			if now.Sub(lastWrite) >= p.checkpointEvery && p.rep.err() == nil {
+				if err := p.writeCheckpoint(ctx); err != nil {
+					log.Printf("checkpoint record: %v", status.Convert(err).Message())
+				} else {
+					lastWrite = now
+				}
+			}
+			for node, age := range p.rep.peerAges(now) {
+				if quiet := age > p.silentAfter; quiet != silent[node] {
+					silent[node] = quiet
+					if quiet {
+						log.Printf("WARNING: instance %q wrote no checkpoint record for %v: it is down, or the backend hides its writes (fork)", node, age.Round(time.Second))
+					} else {
+						log.Printf("instance %q writes checkpoint records again", node)
+					}
+				}
+			}
 		}
 	}
+}
+
+// writeCheckpoint stores this instance's latest verified checkpoint as its record.
+func (p *proxy) writeCheckpoint(ctx context.Context) error {
+	cp, ok := p.rep.checkpoint()
+	if !ok {
+		return nil
+	}
+	_, err := p.txn(ctx, &pb.TxnRequest{Success: []*pb.RequestOp{{Request: &pb.RequestOp_RequestPut{RequestPut: &pb.PutRequest{
+		Key: []byte(checkpointPrefix + p.node), Value: formatRecord(cp, time.Now())}}}}}, true)
+	return err
+}
+
+// removeCheckpoint deletes this instance's record when it leaves the cluster, so the others
+// do not wait for it.
+func (p *proxy) removeCheckpoint(ctx context.Context) error {
+	_, err := p.txn(ctx, &pb.TxnRequest{Success: []*pb.RequestOp{{Request: &pb.RequestOp_RequestDeleteRange{
+		RequestDeleteRange: &pb.DeleteRangeRequest{Key: []byte(checkpointPrefix + p.node)}}}}}, true)
+	return err
 }
 
 // ---------------------------------------------------------------- gRPC services
 
 type proxy struct {
-	s        *sealer
-	kv       pb.KVClient
-	watch    pb.WatchClient
-	lease    pb.LeaseClient
-	maint    pb.MaintenanceClient
-	rep      *replica
-	fresh    *freshness
-	delay    time.Duration
-	verbose  bool
-	addr     string
-	self     string
-	peerAddr string
-	opsAddr  string
+	s       *sealer
+	kv      pb.KVClient
+	watch   pb.WatchClient
+	lease   pb.LeaseClient
+	maint   pb.MaintenanceClient
+	rep     *replica
+	fresh   *freshness
+	delay   time.Duration
+	verbose bool
+	addr    string
+	self    string
+	node    string // this instance's name in checkpoint records
+	opsAddr string
+
+	checkpointEvery, silentAfter time.Duration
 
 	metrics  *metrics
 	srv      *grpc.Server
@@ -1337,7 +1210,7 @@ func (p *proxy) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRespons
 
 func (p *proxy) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {
 	p.logf("Put %q (%d bytes)", r.Key, len(r.Value))
-	resp, err := p.txn(ctx, &pb.TxnRequest{Success: []*pb.RequestOp{{Request: &pb.RequestOp_RequestPut{RequestPut: r}}}})
+	resp, err := p.txn(ctx, &pb.TxnRequest{Success: []*pb.RequestOp{{Request: &pb.RequestOp_RequestPut{RequestPut: r}}}}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1346,7 +1219,7 @@ func (p *proxy) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, err
 
 func (p *proxy) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
 	p.logf("DeleteRange %q %q", r.Key, r.RangeEnd)
-	resp, err := p.txn(ctx, &pb.TxnRequest{Success: []*pb.RequestOp{{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: r}}}})
+	resp, err := p.txn(ctx, &pb.TxnRequest{Success: []*pb.RequestOp{{Request: &pb.RequestOp_RequestDeleteRange{RequestDeleteRange: r}}}}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1361,7 +1234,7 @@ func (p *proxy) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, err
 		}
 		p.logf("Txn compare=%q", keys)
 	}
-	return p.txn(ctx, r)
+	return p.txn(ctx, r, false)
 }
 
 // write is one key changed by a transaction's success branch.
@@ -1378,7 +1251,7 @@ func unsupported(what string) error {
 // replaces (so the value can name its predecessor), adds a delete receipt,
 // and then checks the backend's verdict and effects against the replica.
 // All results sent back to the client come from the replica.
-func (p *proxy) txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
+func (p *proxy) txn(ctx context.Context, r *pb.TxnRequest, internal bool) (*pb.TxnResponse, error) {
 	for _, c := range r.Compare {
 		if len(c.RangeEnd) > 0 {
 			return nil, unsupported("range compares")
@@ -1410,7 +1283,7 @@ func (p *proxy) txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, err
 		}
 	}
 	for _, w := range writes {
-		if strings.HasPrefix(w.key, "/veil/") {
+		if strings.HasPrefix(w.key, "/veil/") && !internal {
 			return nil, status.Error(codes.PermissionDenied, "veil: /veil/ is reserved")
 		}
 	}

@@ -108,14 +108,23 @@ type replica struct {
 	digest     *big.Int             // keyed set hash of the state at rev
 	header     pb.ResponseHeader    // cluster/member ids of the backend
 	claims     map[int64][32]byte   // digests reported by peers for revisions we have not reached
+	records    map[string]record    // checkpoint records by instance (see checkpointLoop)
+	self       string               // this instance's name in checkpoint records
 	changed    chan struct{}        // closed and replaced on every change
+}
+
+// record is the latest checkpoint record of an instance.
+type record struct {
+	cp    checkpoint
+	wrote time.Time // the writer's clock
+	seen  time.Time // when this instance applied it (load: the writer's clock)
 }
 
 func newReplica(s *sealer, window time.Duration) *replica {
 	return &replica{
 		s: s, digKey: s.digestKey, window: window,
 		keys: map[string][]version{}, digest: new(big.Int),
-		claims: map[int64][32]byte{}, changed: make(chan struct{}),
+		claims: map[int64][32]byte{}, records: map[string]record{}, changed: make(chan struct{}),
 	}
 }
 
@@ -204,16 +213,75 @@ func (r *replica) digestAt(rev int64) ([32]byte, bool) {
 func (r *replica) claim(c checkpoint) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.claimLocked(c); err != nil {
+		go r.fail(err)
+	}
+}
+
+func (r *replica) claimLocked(c checkpoint) error {
 	if c.rev > r.rev || !r.loaded {
 		if len(r.claims) < 10000 {
 			r.claims[c.rev] = c.digest
 		}
-		return
+		return nil
 	}
 	if d, ok := r.digestAtLocked(c.rev); ok && d != c.digest {
-		go r.fail(dataLoss("another instance saw a different state at revision %d: the backend shows different histories (fork)", c.rev))
+		return dataLoss("another instance saw a different state at revision %d: the backend shows different histories (fork)", c.rev)
 	}
+	return nil
 }
+
+// recordLocked takes note of a checkpoint record (key under checkpointPrefix) and checks
+// another instance's checkpoint against our history. seen is zero for snapshot loads.
+func (r *replica) recordLocked(key string, v version, seen time.Time) error {
+	node, ok := strings.CutPrefix(key, checkpointPrefix)
+	if !ok {
+		return nil
+	}
+	if v.deleted {
+		delete(r.records, node)
+		return nil
+	}
+	cp, wrote, err := parseRecord(v.value)
+	if err != nil {
+		return dataLoss("checkpoint record of %q: %v", node, err) // written with the master key, so never malformed
+	}
+	if seen.IsZero() {
+		seen = wrote
+	}
+	r.records[node] = record{cp: cp, wrote: wrote, seen: seen}
+	if node == r.self {
+		return nil
+	}
+	return r.claimLocked(cp)
+}
+
+// newestRecord is the highest revision named by any checkpoint record.
+func (r *replica) newestRecord() int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var n int64
+	for _, rec := range r.records {
+		n = max(n, rec.cp.rev)
+	}
+	return n
+}
+
+// peerAges says, for every other instance with a record, how long ago its record changed.
+func (r *replica) peerAges(now time.Time) map[string]time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := map[string]time.Duration{}
+	for node, rec := range r.records {
+		if node != r.self {
+			out[node] = now.Sub(rec.seen)
+		}
+	}
+	return out
+}
+
+// hidden keys are the proxy's own bookkeeping, never shown to clients.
+func hidden(key string) bool { return strings.HasPrefix(key, "/veil/") }
 
 // ---------------------------------------------------------------- loading a snapshot
 
@@ -262,6 +330,12 @@ func (r *replica) load(ctx context.Context, kv pb.KVClient, rev int64) error {
 	r.loaded, r.rev, r.base, r.keys, r.order, r.hist, r.digest = true, at, at, keys, order, nil, digest
 	r.baseDigest = r.digestBytes()
 	r.header = *resp.Header
+	r.records = map[string]record{}
+	for i := sort.SearchStrings(order, checkpointPrefix); i < len(order) && strings.HasPrefix(order[i], checkpointPrefix); i++ {
+		if err := r.recordLocked(order[i], keys[order[i]][0], time.Time{}); err != nil {
+			go r.fail(err)
+		}
+	}
 	for crev, d := range r.claims {
 		if crev <= at {
 			delete(r.claims, crev)
@@ -498,6 +572,11 @@ func (r *replica) apply(rev int64, evs []*mvccpb.Event) error {
 			return dataLoss("another instance saw a different state at revision %d: the backend shows different histories (fork)", rev)
 		}
 	}
+	for _, c := range changes {
+		if err := r.recordLocked(c.key, c.cur, time.Now()); err != nil {
+			return err
+		}
+	}
 	r.trimLocked()
 	r.notifyLocked()
 	return nil
@@ -607,7 +686,7 @@ func (r *replica) serveRangeLocked(req *pb.RangeRequest, kr keyRange, at int64) 
 	var kvs []*mvccpb.KeyValue
 	add := func(key string) {
 		v, ok := r.atLocked(key, at)
-		if !ok ||
+		if !ok || hidden(key) ||
 			(req.MinModRevision > 0 && v.modRev < req.MinModRevision) ||
 			(req.MaxModRevision > 0 && v.modRev > req.MaxModRevision) ||
 			(req.MinCreateRevision > 0 && v.createRev < req.MinCreateRevision) ||
@@ -796,7 +875,7 @@ func (p *proxy) runWatcher(ctx context.Context, id int64, next *atomic.Int64, kr
 		var batch []*mvccpb.Event
 		for _, h := range rep.hist[i:] {
 			for _, c := range h.changes {
-				if !rep.matches(kr, c.key) {
+				if !rep.matches(kr, c.key) || hidden(c.key) {
 					continue
 				}
 				ev := &mvccpb.Event{Type: mvccpb.PUT, Kv: c.cur.kv(c.key, false)}

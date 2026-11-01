@@ -6,8 +6,7 @@
 # Usage: ETCD_DIR=/path/to/etcd-release K3S_BIN=/path/to/k3s ./test.sh [simulated-rtt]
 #   e.g. ./test.sh 30ms
 #
-# Needs a test build with the TPM simulator: go build -tags tpmsim -o veil-proxy-tpmsim .
-# Every instance gets its own simulated TPM (seeds 1, 2, 3 = three machines).
+# Needs the binary: go build -o veil-proxy .
 # shellcheck disable=SC2046 # $(mtls ...) is split into flags on purpose
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -15,17 +14,15 @@ WORK=${WORK:-$HERE/.testrun}
 DELAY=${1:-0s}
 ETCD_DIR=${ETCD_DIR:?set ETCD_DIR to an extracted etcd release}
 K3S_BIN=${K3S_BIN:?set K3S_BIN to a k3s binary}
-PROXY=$HERE/veil-proxy-tpmsim
+PROXY=$HERE/veil-proxy
 KC="$K3S_BIN kubectl --kubeconfig $WORK/kubeconfig"
 PKI=$WORK/pki
 # The hoster's view of the backend: etcd only accepts certificates from the device CA.
 ETCDCTL="$ETCD_DIR/etcdctl --endpoints=https://127.0.0.1:2379 --cacert $PKI/server-ca.pem --cert $PKI/operator.pem --key $PKI/operator-key.pem"
 ETCD_TLS="--cert-file $PKI/etcd.pem --key-file $PKI/etcd-key.pem --client-cert-auth --trusted-ca-file $PKI/device-ca.pem"
-# simulated TPM of each node, and its mTLS + TPM flags
-seed() { case $1 in node-a) echo 1 ;; node-b) echo 2 ;; node-c) echo 3 ;; esac; }
+# mTLS flags and master key of each node
 mtls() {
-  echo "-tpm simulator:$(seed $1) -cert $PKI/$1.pem -key $PKI/$1.tpmkey -key-file $PKI/$1-master.sealed" \
-    "-backend-ca $PKI/server-ca.pem -peer-ca $PKI/device-ca.pem"
+  echo "-cert $PKI/$1.pem -key $PKI/$1.key -key-file $PKI/$1-master.key -backend-ca $PKI/server-ca.pem"
 }
 PASS=0
 FAIL=0
@@ -39,6 +36,7 @@ ms()   { echo $(( ($2 - $1) / 1000000 )); }
 stop
 rm -rf "$WORK" && mkdir -p "$WORK" && cd "$WORK" || exit 1
 [ -f "$HERE/master.key" ] || "$PROXY" -gen-key > "$HERE/master.key"
+chmod 600 "$HERE/master.key"
 
 echo "== certificates: hoster server CA, device CA, one device certificate per node"
 mkdir -p "$PKI"
@@ -46,7 +44,7 @@ ca() {
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj "/CN=$1" \
     -keyout "$PKI/$1-key.pem" -out "$PKI/$1.pem" 2> /dev/null
 }
-cert() { # name, issuing ca, subjectAltName (uses an existing $1.csr, e.g. from the TPM)
+cert() { # name, issuing ca, subjectAltName (uses an existing $1.csr, e.g. from veil-proxy keygen)
   [ -f "$PKI/$1.csr" ] || openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$1" \
     -keyout "$PKI/$1-key.pem" -out "$PKI/$1.csr" 2> /dev/null
   printf 'subjectAltName=%s\nextendedKeyUsage=clientAuth,serverAuth\nkeyUsage=digitalSignature\n' "$3" > "$PKI/$1.ext"
@@ -58,15 +56,15 @@ ca device-ca
 cert etcd server-ca "IP:127.0.0.1"
 cert operator device-ca "IP:127.0.0.1"
 for n in node-a node-b node-c; do
-  # key generated inside the node's TPM, only the CSR leaves it
-  "$PROXY" tpm-keygen -tpm "simulator:$(seed "$n")" -out "$PKI/$n.tpmkey" -csr "$PKI/$n.csr" \
+  # device key generated on the node, only the CSR leaves it
+  "$PROXY" keygen -out "$PKI/$n.key" -csr "$PKI/$n.csr" \
     -uri "spiffe://veilplane.com/cluster/demo/node/$n" -ip 127.0.0.1
   cert $n device-ca "IP:127.0.0.1,URI:spiffe://veilplane.com/cluster/demo/node/$n"
-  # the shared master key, sealed by each node's own TPM
-  "$PROXY" tpm-seal -tpm "simulator:$(seed "$n")" -in "$HERE/master.key" -out "$PKI/$n-master.sealed"
+  # every node has its own copy of the shared master key
+  install -m 600 "$HERE/master.key" "$PKI/$n-master.key"
 done
-head -1 "$PKI/node-a.tpmkey" | grep -q "VEIL TPM KEY" && head -1 "$PKI/node-a-master.sealed" | grep -q "VEIL TPM SEALED" \
-  && ok "device keys and master key exist only as TPM blobs" || bad "TPM blobs"
+[ "$(stat -c %a "$PKI/node-a.key")" = 600 ] && [ "$(stat -c %a "$PKI/node-a-master.key")" = 600 ] \
+  && ok "device key and master key are only readable by their owner" || bad "key file modes"
 openssl x509 -in "$PKI/node-a.pem" -noout -ext subjectAltName 2> /dev/null | grep -q "spiffe://veilplane.com/cluster/demo/node/node-a" \
   && ok "device certificate carries spiffe://veilplane.com/cluster/demo/node/node-a" || bad "device certificate"
 
@@ -74,13 +72,13 @@ echo "== starting stack (simulated backend RTT: $DELAY)"
 "$ETCD_DIR/etcd" --data-dir etcd-data --listen-client-urls https://127.0.0.1:2379 $ETCD_TLS \
   --advertise-client-urls https://127.0.0.1:2379 --listen-peer-urls http://127.0.0.1:2380 > etcd.log 2>&1 &
 echo $! > etcd.pid
-# Two proxy instances, as on two different machines: k3s uses A, B only
-# exchanges checkpoints with A. Both talk mTLS to the backend and to each other.
-"$PROXY" -key-file "$HERE/master.key" -delay "$DELAY" -v -state-file a.state $(mtls node-a) \
-  -upstream 127.0.0.1:2379 -peer-listen 127.0.0.1:2390 -peers 127.0.0.1:2391 -ops-listen 127.0.0.1:9390 > proxy.log 2>&1 &
+# Two proxy instances, as on two different machines: k3s uses A, B only follows the backend.
+# Both talk mTLS to the backend only; they learn of each other through checkpoint records.
+"$PROXY" -delay "$DELAY" -v -state-file a.state $(mtls node-a) \
+  -upstream 127.0.0.1:2379 -ops-listen 127.0.0.1:9390 > proxy.log 2>&1 &
 echo $! > proxy.pid
-"$PROXY" -key-file "$HERE/master.key" -listen 127.0.0.1:2399 -state-file b.state $(mtls node-b) \
-  -peer-listen 127.0.0.1:2391 -peers 127.0.0.1:2390 -ops-listen 127.0.0.1:9391 > proxy-b.log 2>&1 &
+"$PROXY" -listen 127.0.0.1:2399 -state-file b.state $(mtls node-b) \
+  -ops-listen 127.0.0.1:9391 > proxy-b.log 2>&1 &
 echo $! > proxy-b.pid
 sleep 2
 ENDPOINT=http://127.0.0.1:2389
@@ -183,7 +181,7 @@ if [ -z "${DIRECT:-}" ]; then
   OLDREV=$($ETCDCTL endpoint status -w json | grep -o '"revision":[0-9]*' | cut -d: -f2)
   $KC create namespace created-after-snapshot > /dev/null
   $KC delete namespace created-after-snapshot --wait=false > /dev/null
-  sleep 3 # A persists and B pulls the mark once per second
+  sleep 3 # the instances persist their checkpoints once per second
   NEWREV=$($ETCDCTL endpoint status -w json | grep -o '"revision":[0-9]*' | cut -d: -f2)
   kill "$(cat k3s.pid)" "$(cat etcd.pid)" 2>/dev/null
   while kill -0 "$(cat etcd.pid)" 2>/dev/null || kill -0 "$(cat k3s.pid)" 2>/dev/null; do sleep 0.2; done
@@ -202,24 +200,25 @@ if [ -z "${DIRECT:-}" ]; then
     && curl -s http://127.0.0.1:9390/metrics | grep -q '^veil_replica_failed 1' \
     && ok "A reports the attack: /readyz 503, veil_replica_failed 1" || bad "attack not visible in ops endpoints"
   OUT=$($ETCD_DIR/etcdctl --endpoints=127.0.0.1:2399 get /registry/namespaces/default 2>&1)
-  echo "$OUT" | grep -q "went back in time" && ok "instance B refuses too (never talked to the backend before)" || bad "B accepted the rollback: $OUT"
+  echo "$OUT" | grep -q "went back in time" && ok "instance B refuses too" || bad "B accepted the rollback: $OUT"
 
-  # A brand new instance C with empty state learns the mark from its peers before serving.
-  "$PROXY" -key-file "$HERE/master.key" -listen 127.0.0.1:2409 -state-file c.state $(mtls node-c) \
-    -peers 127.0.0.1:2390,127.0.0.1:2391 -ops-listen 127.0.0.1:9392 > proxy-c.log 2>&1 &
+  # A brand new instance C, set up with the state of A as an invite does, refuses as well.
+  cp a.state c.state
+  "$PROXY" -listen 127.0.0.1:2409 -state-file c.state $(mtls node-c) \
+    -ops-listen 127.0.0.1:9392 > proxy-c.log 2>&1 &
   echo $! > proxy-c.pid
   sleep 2
   OUT=$($ETCD_DIR/etcdctl --endpoints=127.0.0.1:2409 get /registry/namespaces/default 2>&1)
   echo "$OUT" | grep -q "went back in time" && ok "brand new instance C refuses too" || bad "C accepted the rollback: $OUT"
 
-  # A restarted instance remembers the mark from its state file, even without peers.
+  # A restarted instance remembers the mark from its state file.
   kill "$(cat proxy.pid)"
   sleep 1
   "$PROXY" -state-file a.state $(mtls node-a) -ops-listen 127.0.0.1:9390 > proxy-a2.log 2>&1 &
   echo $! > proxy.pid
   sleep 2
   OUT=$($ETCD_DIR/etcdctl --endpoints=127.0.0.1:2389 get /registry/namespaces/default 2>&1)
-  echo "$OUT" | grep -q "went back in time" && ok "restarted instance A (no peers) still refuses" || bad "restarted A accepted the rollback: $OUT"
+  echo "$OUT" | grep -q "went back in time" && ok "restarted instance A still refuses" || bad "restarted A accepted the rollback: $OUT"
 fi
 
 echo "== result: $PASS passed, $FAIL failed (logs in $WORK)"

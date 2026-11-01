@@ -8,7 +8,6 @@ texts of these modules (e.g. collected with `go-licenses save`).
 | Module | License |
 |---|---|
 | github.com/tink-crypto/tink-go/v2 | Apache-2.0 |
-| github.com/google/go-tpm | Apache-2.0 |
 | go.etcd.io/etcd/api/v3 | Apache-2.0 |
 | google.golang.org/grpc | Apache-2.0 |
 | google.golang.org/genproto | Apache-2.0 |
@@ -16,10 +15,6 @@ texts of these modules (e.g. collected with `go-licenses save`).
 | github.com/golang/protobuf | BSD-3-Clause |
 | github.com/gogo/protobuf | BSD-3-Clause |
 | golang.org/x/net, golang.org/x/sys, golang.org/x/text | BSD-3-Clause |
-
-Test builds only (`-tags tpmsim`, never distributed): github.com/google/go-tpm-tools
-(Apache-2.0), which includes Microsoft's TPM 2.0 reference implementation
-(BSD-2-Clause style license, see its source).
 
 ## gRPC NOTICE
 
